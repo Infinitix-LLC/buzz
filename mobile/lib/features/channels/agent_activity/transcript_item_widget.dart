@@ -69,6 +69,7 @@ class _MessageItemWidget extends StatelessWidget {
           if (item.text.isNotEmpty)
             GptMarkdown(
               item.text,
+              autolink: false,
               style: context.textTheme.bodyMedium?.copyWith(
                 color: context.colors.onSurface,
               ),
@@ -140,6 +141,7 @@ class _ThoughtItemWidget extends HookWidget {
                 const SizedBox(height: Grid.half),
                 GptMarkdown(
                   item.text,
+                  autolink: false,
                   style: context.textTheme.bodySmall?.copyWith(
                     color: context.colors.onSurfaceVariant,
                   ),
