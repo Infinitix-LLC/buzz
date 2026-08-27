@@ -38,7 +38,7 @@ dependencies:
   val_flutter:
     git:
       url: git@github.com:Infinitix-LLC/val_flutter.git
-      ref: main
+      ref: demo
   # `paintInto` — the shared painter both the streamed and the local player
   # composite through, so a scene looks the same either way. Git, not path:
   # val_flutter resolves it from git, and pub cannot reconcile the two sources

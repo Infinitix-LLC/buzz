@@ -712,9 +712,11 @@ packages:
   gpt_markdown:
     dependency: "direct main"
     description:
-      path: "/Users/sohag/Projects/gate/gpt_markdown"
-      relative: false
-    source: path
+      path: "."
+      ref: "feature/gen_ui"
+      resolved-ref: "5e556922c401a315b0b54855d8c92092c8163918"
+      url: "git@github.com:Infinitix-LLC/gpt_markdown.git"
+    source: git
     version: "1.2.1"
   gtk:
     dependency: transitive
@@ -1672,9 +1674,11 @@ packages:
   val_flutter:
     dependency: "direct main"
     description:
-      path: "/Users/sohag/Projects/gate/val_flutter"
-      relative: false
-    source: path
+      path: "."
+      ref: main
+      resolved-ref: "3f12568498b746cfc88a6f498face6160e83ddd2"
+      url: "git@github.com:Infinitix-LLC/val_flutter.git"
+    source: git
     version: "0.0.2"
   val_player:
     dependency: "direct main"
