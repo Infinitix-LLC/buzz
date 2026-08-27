@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/relay/relay.dart';
+import 'gen_ui_demo/showcase_thread.dart';
 import 'pending_local_messages_provider.dart';
 import 'channel_window.dart';
 import 'thread_replies_provider.dart';
@@ -45,6 +46,13 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
 
   @override
   AsyncValue<List<NostrEvent>> build() {
+    // The showcase thread is scripted and never reaches the relay, so it must
+    // answer before anything here waits on a session — otherwise it shows a
+    // spinner until a connection it does not need comes up.
+    if (channelId == showcaseChannelId) {
+      return AsyncData(showcaseMessages(ref.watch(myPubkeyProvider) ?? ''));
+    }
+
     final sessionState = ref.watch(relaySessionProvider);
     ref.onDispose(() {
       _initVersion++;

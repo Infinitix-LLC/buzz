@@ -28,6 +28,8 @@ import 'channels_provider.dart';
 import 'media_viewer_page.dart';
 import 'message_content/link_normalizer.dart';
 import 'message_media.dart';
+import 'gen_ui_demo/gen_ui_registry_provider.dart';
+import 'gen_ui_demo/val_artifact_scope.dart';
 
 part 'message_content/media_carousel.dart';
 part 'message_content/token_pill.dart';
@@ -260,42 +262,51 @@ class MessageContent extends HookConsumerWidget {
       key: ValueKey(
         '$finalContent\u0000$mentionPresentationKey\u0000$channelPresentationKey',
       ),
-      child: GptMarkdown(
-        finalContent,
-        style: style,
-        followLinkColor: false,
-        // Bare URLs are already rewritten by `normalizeBareLinks` above, so the
-        // package's own autolinker would be a second pass over the same text.
-        autolink: false,
-        codeBuilder: (context, name, code, closed) =>
-            _MessageCodeBlock(name: name, code: code),
-        linkBuilder: (context, linkText, url, linkStyle) => _buildLink(
-          context,
-          ref,
-          linkText,
-          url,
-          linkStyle,
-          style,
-          resolvedChannelTap,
-          resolvedChannelNames,
+      // A `val_scene` directive renders a card that reads its status from an
+      // artifact store above it. Scoping here rather than at the page keeps the
+      // store's lifetime tied to the message that needs it.
+      child: ValArtifactScope(
+        child: GptMarkdown(
+          finalContent,
+          style: style,
+          // Renders `genui{...}` directives an agent puts in a message. Types
+          // Buzz owns — the agent board, per-agent progress — are registered in
+          // `genUiRegistryProvider` alongside the ones gpt_markdown ships.
+          genUiBuilder: ref.watch(genUiRegistryProvider).build,
+          followLinkColor: false,
+          // Bare URLs are already rewritten by `normalizeBareLinks` above, so the
+          // package's own autolinker would be a second pass over the same text.
+          autolink: false,
+          codeBuilder: (context, name, code, closed) =>
+              _MessageCodeBlock(name: name, code: code),
+          linkBuilder: (context, linkText, url, linkStyle) => _buildLink(
+            context,
+            ref,
+            linkText,
+            url,
+            linkStyle,
+            style,
+            resolvedChannelTap,
+            resolvedChannelNames,
+          ),
+          imageBuilder: (context, imageUrl, width, height) =>
+              _buildMedia(context, imageUrl, imetaByUrl[imageUrl]),
+          textAlign: textAlign,
+          maxLines: maxLines,
+          inlineComponents: [
+            _MentionMd(
+              mentionNames: resolvedMentionNames,
+              agentMentionPubkeys: resolvedAgentMentionPubkeys,
+              onMentionTap: onMentionTap,
+            ),
+            CustomEmojiMd(customEmoji, size: inlineCustomEmojiSize),
+            _ChannelLinkMd(
+              channelNames: resolvedChannelNames,
+              onChannelTap: resolvedChannelTap,
+            ),
+            ...MarkdownComponent.inlineComponents,
+          ],
         ),
-        imageBuilder: (context, imageUrl, width, height) =>
-            _buildMedia(context, imageUrl, imetaByUrl[imageUrl]),
-        textAlign: textAlign,
-        maxLines: maxLines,
-        inlineComponents: [
-          _MentionMd(
-            mentionNames: resolvedMentionNames,
-            agentMentionPubkeys: resolvedAgentMentionPubkeys,
-            onMentionTap: onMentionTap,
-          ),
-          CustomEmojiMd(customEmoji, size: inlineCustomEmojiSize),
-          _ChannelLinkMd(
-            channelNames: resolvedChannelNames,
-            onChannelTap: resolvedChannelTap,
-          ),
-          ...MarkdownComponent.inlineComponents,
-        ],
       ),
     );
     if (trailingGallery == null) return markdown;

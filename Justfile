@@ -695,8 +695,16 @@ mobile-emoji-data:
 
 # Compile an unsigned Android debug APK (worktree-aware debug identity)
 mobile-build-android:
+    #!/usr/bin/env bash
+    set -euo pipefail
     ./scripts/mobile-worktree-overrides.sh
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && flutter build apk --debug --no-pub
+    unset GIT_DIR GIT_WORK_TREE
+    cd {{mobile_dir}}
+    if [ -f .env.json ]; then
+        flutter build apk --debug --no-pub --dart-define-from-file=.env.json
+    else
+        flutter build apk --debug --no-pub
+    fi
 
 # Run the mobile app on iOS simulator (worktree-aware debug identity)
 mobile-dev:
@@ -709,7 +717,14 @@ mobile-dev:
     ./scripts/mobile-worktree-overrides.sh
     cd {{mobile_dir}}
     unset GIT_DIR GIT_WORK_TREE
-    flutter run
+    # `.env.json` is the documented place for local config and keys
+    # (see mobile/.env.json.example and shared/relay/relay_provider.dart).
+    # It is gitignored, and optional — without it the app uses its defaults.
+    if [ -f .env.json ]; then
+        flutter run --dart-define-from-file=.env.json
+    else
+        flutter run
+    fi
 
 # Uninstall stale worktree-suffixed Buzz debug installs (production apps kept)
 mobile-clean:

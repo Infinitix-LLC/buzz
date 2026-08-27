@@ -7,6 +7,7 @@ import '../../shared/profile/user_profile.dart';
 import 'channel.dart';
 import 'channel_messages_provider.dart';
 import 'message_mention_pubkeys.dart';
+import 'gen_ui_demo/gen_ui_demo_responder.dart';
 import 'local_message_send_animation_provider.dart';
 
 /// Sends messages by signing an event with the user's nsec and publishing it
@@ -21,6 +22,7 @@ class SendMessage {
   final void Function(String channelId, String eventId) _completeLocalMessage;
   final void Function(String channelId, String eventId) _removeLocalMessage;
   final bool Function()? _isDeliveryValid;
+  final void Function(String channelId, String content)? _onSent;
 
   SendMessage({
     required SignedEventRelay signedEventRelay,
@@ -34,6 +36,7 @@ class SendMessage {
     completeLocalMessage,
     required void Function(String channelId, String eventId) removeLocalMessage,
     bool Function()? isDeliveryValid,
+    void Function(String channelId, String content)? onSent,
   }) : _signedEventRelay = signedEventRelay,
        _fetchMembers = fetchMembers,
        _readUserCache = readUserCache,
@@ -42,7 +45,8 @@ class SendMessage {
            markLocalMessageForAnimation ?? ((_, _) {}),
        _completeLocalMessage = completeLocalMessage,
        _removeLocalMessage = removeLocalMessage,
-       _isDeliveryValid = isDeliveryValid;
+       _isDeliveryValid = isDeliveryValid,
+       _onSent = onSent;
 
   /// Send a text message to a channel.
   ///
@@ -109,6 +113,7 @@ class SendMessage {
       );
       final event = localMessage;
       if (event != null) _completeLocalMessage(channelId, event.id);
+      _onSent?.call(channelId, content);
     } catch (_) {
       final event = localMessage;
       if (event != null) _removeLocalMessage(channelId, event.id);
@@ -247,6 +252,10 @@ final sendMessageProvider = Provider<SendMessage>((ref) {
     removeLocalMessage: (channelId, eventId) => ref
         .read(channelMessagesProvider(channelId).notifier)
         .removeLocalMessage(eventId),
+    // Gen-UI demo: answers a question in a channel with a live board. Local
+    // only — see `gen_ui_demo/gen_ui_demo_responder.dart`.
+    onSent: (channelId, content) =>
+        ref.read(genUiDemoResponderProvider).maybeRespond(channelId, content),
     isDeliveryValid: () {
       final currentConfig = ref.read(relayConfigProvider);
       return currentConfig.baseUrl == config.baseUrl &&

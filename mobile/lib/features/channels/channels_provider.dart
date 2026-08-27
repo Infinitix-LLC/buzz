@@ -11,6 +11,7 @@ import '../../shared/utils/string_utils.dart';
 import 'channel.dart';
 import 'channel_management_provider.dart'
     show ChannelMember, channelDetailsProvider;
+import 'gen_ui_demo/showcase_thread.dart';
 import 'channel_mutes/channel_mutes_provider.dart';
 import 'huddle_channel_filter.dart';
 import '../../shared/read_state/read_state_provider.dart';
@@ -115,11 +116,23 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
 
     if (sessionState.status != SessionStatus.connected) {
       // Keep the prior community's cache visible until the new relay connects.
-      if (_hasLoaded) return state.value ?? const [];
+      if (_hasLoaded) return _withShowcase(state.value ?? const []);
       await connected.future;
     }
 
     return _fetch(subscribeLive: true);
+  }
+
+  /// Splices the scripted showcase thread in alongside the real channels.
+  ///
+  /// Added here rather than at a call site so every path that produces a
+  /// channel list carries it — including the one that returns the cached list
+  /// while the relay is still connecting, which is exactly when someone opens
+  /// the app to demo it.
+  List<Channel> _withShowcase(List<Channel> channels) {
+    if (channels.any((c) => c.id == showcaseChannelId)) return channels;
+    final pubkey = ref.read(myPubkeyProvider) ?? '';
+    return [showcaseChannel(pubkey), ...channels];
   }
 
   Future<List<Channel>> _fetch({
@@ -131,7 +144,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
       fetchLastMessage: fetchLastMessage,
     );
     _hasLoaded = true;
-    return channels;
+    return _withShowcase(channels);
   }
 
   Future<List<Channel>> _fetchChannels({
