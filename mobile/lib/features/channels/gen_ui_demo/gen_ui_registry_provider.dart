@@ -25,20 +25,17 @@ import 'val_local_scene.dart';
 final genUiRegistryProvider = Provider<GenUiRegistry>((ref) {
   // `chatGenUiRegistry` adds `val_scene` on top of the defaults, so a VAL
   // animation renders through the same path as a chart rather than being
-  // special-cased in the bubble. It needs a `ValArtifactScope` above it.
-  final registry = chatGenUiRegistry(
-    GenUiRegistry.defaults(
-      // A type nobody has registered is a host's gap, not a parse failure.
-      // Rendering a quiet marker beats a blank line that looks like the
-      // message simply failed to arrive.
-      unknownBuilder: (context, model) => _UnknownType(type: model.type),
-    ),
-  );
-
-  // Captured before the override below replaces it.
-  final streamedScene = registry.builderFor('val_scene');
-
-  return registry
+  // special-cased in the bubble. Its streamed implementation is replaced
+  // below, so the `ValArtifactScope` in `message_content.dart` is no longer
+  // load-bearing — it is left in place for the day streaming comes back.
+  return chatGenUiRegistry(
+      GenUiRegistry.defaults(
+        // A type nobody has registered is a host's gap, not a parse failure.
+        // Rendering a quiet marker beats a blank line that looks like the
+        // message simply failed to arrive.
+        unknownBuilder: (context, model) => _UnknownType(type: model.type),
+      ),
+    )
     ..register(
       'agent_board',
       (context, model) => AgentBoardWidget(attributes: model.attributes),
@@ -59,22 +56,14 @@ final genUiRegistryProvider = Provider<GenUiRegistry>((ref) {
       'ci_run',
       (context, model) => CiRunWidget(attributes: model.attributes),
     )
-    // Extends, rather than replaces, the streamed `val_scene` that
-    // `chatGenUiRegistry` adds — the two are different mechanisms behind one
-    // directive, and which one applies is decided by the payload:
+    // Replaces the streamed `val_scene` that `chatGenUiRegistry` adds, for
+    // every payload including one carrying an artifact `id`.
     //
-    //   `id` present -> a stored artifact the server renders and streams.
-    //   no `id`      -> the script is in the app, the server only compiles it,
-    //                   and the engine runs the instruction list on-device.
-    //
-    // Overriding unconditionally would strip the streamed path out of the demo
-    // entirely, including the poster and progress states the gateway drives.
+    // The streamed version renders a poster with a play button and opens the
+    // scene in a modal sheet. A scene that plays inline the moment it arrives
+    // reads as part of the answer instead of as an attachment to open, so the
+    // demo uses the local engine everywhere and ignores `id` entirely.
     ..register('val_scene', (context, model) {
-      final id = genUiString(model.attributes['id']);
-      if (id != null && id.isNotEmpty && streamedScene != null) {
-        return streamedScene(context, model);
-      }
-
       final frame = genUiString(model.attributes['frame']) ?? 'landscape';
       return AspectRatio(
         aspectRatio: switch (frame) {

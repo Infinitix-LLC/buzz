@@ -1,3 +1,4 @@
+import 'package:buzz/features/channels/gen_ui_demo/val_local_scene.dart';
 import 'package:buzz/features/channels/gen_ui_demo/showcase_thread.dart';
 import 'package:buzz/features/channels/gen_ui_demo/demo_workspace.dart';
 import 'package:buzz/features/channels/gen_ui_demo/gen_ui_demo_replies.dart';
@@ -410,12 +411,12 @@ void main() {
   });
 
   group('val_scene directive', () {
-    testWidgets('a ready scene renders a poster inside a message', (
+    testWidgets('plays inline rather than offering a poster to open', (
       tester,
     ) async {
-      // The whole path: directive -> registry -> ValArtifactCard -> poster.
-      // The scene arrives already ready, so nothing is polled and playback
-      // needs only the id — the render endpoint is unauthenticated.
+      // The demo deliberately drops the streamed poster-and-sheet presentation,
+      // including for a payload carrying an artifact `id`: a scene that plays
+      // where it lands reads as part of the answer, not as an attachment.
       await pumpBoard(
         tester,
         'Easier to watch.\n\n'
@@ -424,26 +425,18 @@ void main() {
         '"frame": "landscape", "status": "ready"}}')}',
       );
 
-      expect(find.text('NIP-42 Authentication Handshake'), findsOneWidget);
-      expect(find.byIcon(Icons.play_arrow_rounded), findsOneWidget);
+      expect(find.byType(ValLocalScene), findsOneWidget);
+      expect(find.byIcon(Icons.play_arrow_rounded), findsNothing);
       expect(find.textContaining('Easier to watch'), findsWidgets);
     });
 
-    testWidgets('a scene still generating reports its progress', (
-      tester,
-    ) async {
+    testWidgets('a payload with no id plays inline too', (tester) async {
       await pumpBoard(
         tester,
-        wrapGenUi(
-          '{"val_scene": {"id": "x", "name": "Scene", '
-          '"status": "running"}}',
-        ),
+        wrapGenUi('{"val_scene": {"name": "Scene", "frame": "landscape"}}'),
       );
 
-      // "running" is what the gateway actually emits while it works. It used
-      // to fall through to "Queued", so the card looked stuck for the whole of
-      // generation.
-      expect(find.text('Generating animation'), findsOneWidget);
+      expect(find.byType(ValLocalScene), findsOneWidget);
     });
   });
 

@@ -112,11 +112,11 @@ The NIP-42 scope question is the only one that needs a person. The rest land on 
     ],
     body:
         '''
-Easier to watch than to read — this is the whole exchange, client to relay.
+Easier to watch than to read.
 
-${_g('{"val_scene": {"id": "tzUQ7N24bPnR67enUoYT", "name": "NIP-42 Authentication Handshake", "frame": "landscape", "status": "ready"}}')}
+${_g('{"val_scene": {"name": "How Buzz knows it is really you", "frame": "landscape"}}')}
 
-The signature is over the relay's own challenge, so a replayed AUTH from another session is refused.''',
+It runs on the device — the script ships in the app and the engine draws every frame here.''',
   ),
   DemoReply(
     name: 'agent board',

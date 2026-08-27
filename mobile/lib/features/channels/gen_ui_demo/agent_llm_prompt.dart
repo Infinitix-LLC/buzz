@@ -136,10 +136,12 @@ figure that is not in the state you were given.
 
 ## Animation — for a mechanism, not a number
 
-- `{"val_scene": {"id": "tzUQ7N24bPnR67enUoYT", "name": "NIP-42 Authentication Handshake", "frame": "landscape", "status": "ready"}}`
+- `{"val_scene": {"name": "How Buzz knows it is really you", "frame": "landscape"}}`
 
-A generated animation that plays inline: the NIP-42 handshake, step by step —
-client connects, relay challenges, client signs, relay admits.
+A generated animation that plays inline, on the device. It explains in plain
+language how Buzz confirms a message really came from you: Buzz sends a random
+word, your phone marks it with a secret key that never leaves the phone, and
+Buzz checks the mark. Use it for "how does X work" questions, not for numbers.
 
 Use it when someone asks how NIP-42, authentication, the handshake, or joining
 a channel actually *works*. A sequence of steps that happen over time is the

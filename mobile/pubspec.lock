@@ -1675,8 +1675,8 @@ packages:
     dependency: "direct main"
     description:
       path: "."
-      ref: main
-      resolved-ref: "3f12568498b746cfc88a6f498face6160e83ddd2"
+      ref: demo
+      resolved-ref: d87dbb8ec0240ae4df0d3f11c78b23e6eb8d9038
       url: "git@github.com:Infinitix-LLC/val_flutter.git"
     source: git
     version: "0.0.2"
