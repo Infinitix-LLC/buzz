@@ -27,14 +27,18 @@ dependencies:
   nostr: ^2.0.0
   pointycastle: ^4.0.0
   url_launcher: ^6.3.2
-  # Local checkout while the gen-UI integration is in development.
-  # Restore `gpt_markdown: ^1.2.1` before pushing.
+  # The gen-UI renderer. Pinned to the branch carrying the gen-UI work rather
+  # than to `^1.2.1` on pub.dev, which does not have it yet.
   gpt_markdown:
-    path: /Users/sohag/Projects/gate/gpt_markdown
+    git:
+      url: git@github.com:Infinitix-LLC/gpt_markdown.git
+      ref: feature/gen_ui
   # Runs a compiled VAL program on-device: `package:val` in-process, one frame
   # per tick. The server only compiles the script.
   val_flutter:
-    path: /Users/sohag/Projects/gate/val_flutter
+    git:
+      url: git@github.com:Infinitix-LLC/val_flutter.git
+      ref: main
   # `paintInto` — the shared painter both the streamed and the local player
   # composite through, so a scene looks the same either way. Git, not path:
   # val_flutter resolves it from git, and pub cannot reconcile the two sources
