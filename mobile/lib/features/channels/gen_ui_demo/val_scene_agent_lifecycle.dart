@@ -7,13 +7,6 @@ library;
 /// The mechanism newcomers understand least: that an agent is a participant in
 /// a channel rather than a service behind a dashboard.
 const String kAgentLifecycleScript = r'''
-const INK = Color(0xFFE8F0FA);
-const MUTED = Color(0xFF93A9C4);
-const BLUE = Color(0xFF4C9AFF);
-const GREEN = Color(0xFF35D07F);
-const PURPLE = Color(0xFFB78CFF);
-const ORANGE = Color(0xFFFFA62B);
-const PANEL = Color(0xFF142235);
 
 const WIDE = 1.0;
 const NEAR = 1.5;

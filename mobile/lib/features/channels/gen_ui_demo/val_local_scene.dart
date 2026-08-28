@@ -10,6 +10,7 @@ import 'package:val_player/val_player.dart'
 
 import 'val_compile_client.dart';
 import 'val_narration_audio.dart';
+import 'val_scene_palette.dart';
 
 /// Runs a VAL script on the device.
 ///
@@ -27,7 +28,7 @@ class ValLocalScene extends StatefulWidget {
     super.key,
     required this.script,
     this.frame = 'landscape',
-    this.background = const Color(0xFF0E0E12),
+    this.background,
     this.autoplay = true,
     this.precompiled,
     this.title,
@@ -49,7 +50,10 @@ class ValLocalScene extends StatefulWidget {
   /// and friends) against the wrong rect, so the composition comes apart.
   final String frame;
 
-  final Color background;
+  /// Painted behind the scene. Defaults to the surrounding surface, so the
+  /// animation blends into the transcript instead of sitting on a slab of its
+  /// own colour.
+  final Color? background;
 
   /// Whether the scene compiles and plays as soon as it is built.
   ///
@@ -168,7 +172,10 @@ class _ValLocalSceneState extends State<ValLocalScene>
     try {
       final program =
           widget.precompiled ??
-          await compileValScript(widget.script, frame: widget.frame);
+          await compileValScript(
+            _withPalette(widget.script),
+            frame: widget.frame,
+          );
       if (!mounted || run != _run) {
         return;
       }
@@ -324,7 +331,9 @@ class _ValLocalSceneState extends State<ValLocalScene>
       final program = await compileValScript(
         script,
         frame: widget.frame,
-        previousScript: widget.script,
+        // The branch inherits the main scene's scope, palette included, so the
+        // scene it continues has to be compiled the same way.
+        previousScript: _withPalette(widget.script),
       );
       if (!mounted || run != _run) {
         return;
@@ -357,6 +366,13 @@ class _ValLocalSceneState extends State<ValLocalScene>
     }
   }
 
+  /// Prefixes [script] with the colours it expects to already exist.
+  ///
+  /// Read from the widget's own context, so the scene is drawn in the theme
+  /// the transcript is currently using.
+  String _withPalette(String script) =>
+      '${valScenePalette(Theme.of(context).colorScheme)}\n$script';
+
   void _log(String message) => debugPrint('VAL script: $message');
 
   /// The engine reports a runtime fault and keeps its remaining instructions
@@ -379,11 +395,13 @@ class _ValLocalSceneState extends State<ValLocalScene>
   @override
   Widget build(BuildContext context) {
     final player = _player;
+    final background =
+        widget.background ?? Theme.of(context).colorScheme.surface;
 
     return ClipRRect(
       borderRadius: BorderRadius.circular(12),
       child: DecoratedBox(
-        decoration: BoxDecoration(color: widget.background),
+        decoration: BoxDecoration(color: background),
         child: switch (_stage) {
           _Stage.idle => _Poster(title: widget.title, onPlay: _start),
           _Stage.compiling => const _Centered(child: _Compiling()),
@@ -394,17 +412,14 @@ class _ValLocalSceneState extends State<ValLocalScene>
           _Stage.running => Stack(
             fit: StackFit.expand,
             children: [
-              _LocalCanvas(player: player!, background: widget.background),
+              _LocalCanvas(player: player!, background: background),
               // Only once the script has run out: a replay control competing
               // with the animation would pull the eye off it.
-              if (_finished)
-                if (widget.followUps.isNotEmpty && !_branched)
-                  _ChoiceOverlay(
-                    choices: widget.followUps,
-                    onChoose: _playFollowUp,
-                  )
-                else
-                  _ReplayOverlay(onReplay: _restart),
+              if (_finished && widget.followUps.isNotEmpty && !_branched)
+                _ChoiceOverlay(
+                  choices: widget.followUps,
+                  onChoose: _playFollowUp,
+                ),
             ],
           ),
         },
@@ -493,9 +508,9 @@ class _Compiling extends StatelessWidget {
         const SizedBox(height: 10),
         Text(
           'Compiling scene',
-          style: Theme.of(
-            context,
-          ).textTheme.labelSmall?.copyWith(color: Colors.white70),
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
         ),
       ],
     );
@@ -565,7 +580,7 @@ class _Poster extends StatelessWidget {
                   name,
                   textAlign: TextAlign.center,
                   style: theme.textTheme.titleSmall?.copyWith(
-                    color: Colors.white,
+                    color: theme.colorScheme.onSurface,
                     fontWeight: FontWeight.w600,
                   ),
                   maxLines: 2,
@@ -580,11 +595,9 @@ class _Poster extends StatelessWidget {
                 fit: BoxFit.scaleDown,
                 child: DecoratedBox(
                   decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.10),
+                    color: theme.colorScheme.secondaryContainer,
                     borderRadius: BorderRadius.circular(999),
-                    border: Border.all(
-                      color: Colors.white.withValues(alpha: 0.22),
-                    ),
+                    border: Border.all(color: theme.colorScheme.outlineVariant),
                   ),
                   child: Padding(
                     padding: const EdgeInsets.symmetric(
@@ -597,14 +610,14 @@ class _Poster extends StatelessWidget {
                         Text(
                           'See how it works',
                           style: theme.textTheme.labelLarge?.copyWith(
-                            color: Colors.white,
+                            color: theme.colorScheme.onSecondaryContainer,
                           ),
                         ),
                         const SizedBox(width: 6),
-                        const Icon(
+                        Icon(
                           Icons.arrow_forward_rounded,
                           size: 16,
-                          color: Colors.white70,
+                          color: theme.colorScheme.onSecondaryContainer,
                         ),
                       ],
                     ),
@@ -612,58 +625,6 @@ class _Poster extends StatelessWidget {
                 ),
               ),
             ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Offered once the scene has played through.
-///
-/// A dimming overlay with the control in the middle, rather than a corner
-/// button. Every corner is occupied by the scene itself — the title runs along
-/// the top and the closing caption along the bottom — so a corner control
-/// landed on top of one or the other. Covering the frame also makes the state
-/// unambiguous: the scene has ended, and this is what to do about it.
-class _ReplayOverlay extends StatelessWidget {
-  const _ReplayOverlay({required this.onReplay});
-
-  final VoidCallback onReplay;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Positioned.fill(
-      child: GestureDetector(
-        onTap: onReplay,
-        child: ColoredBox(
-          color: Colors.black.withValues(alpha: 0.45),
-          child: Center(
-            child: FittedBox(
-              fit: BoxFit.scaleDown,
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(999),
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.24),
-                  ),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 18,
-                    vertical: 9,
-                  ),
-                  child: Text(
-                    'Show again',
-                    style: theme.textTheme.labelLarge?.copyWith(
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
-              ),
-            ),
           ),
         ),
       ),
@@ -686,8 +647,11 @@ class _ChoiceOverlay extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Positioned.fill(
+      // Veiled in the surrounding surface rather than in black: on a light
+      // transcript a black scrim reads as a modal dropped on the page, which
+      // is the opposite of the scene blending into it.
       child: ColoredBox(
-        color: Colors.black.withValues(alpha: 0.45),
+        color: theme.colorScheme.surface.withValues(alpha: 0.86),
         child: Center(
           child: FittedBox(
             fit: BoxFit.scaleDown,
@@ -699,7 +663,7 @@ class _ChoiceOverlay extends StatelessWidget {
                   Text(
                     'What do you do?',
                     style: theme.textTheme.titleSmall?.copyWith(
-                      color: Colors.white,
+                      color: theme.colorScheme.onSurface,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
@@ -735,8 +699,9 @@ class _ChoiceChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
     return Material(
-      color: Colors.white.withValues(alpha: 0.12),
+      color: scheme.secondaryContainer,
       borderRadius: BorderRadius.circular(999),
       child: InkWell(
         borderRadius: BorderRadius.circular(999),
@@ -745,7 +710,9 @@ class _ChoiceChip extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
           child: Text(
             label,
-            style: theme.textTheme.labelLarge?.copyWith(color: Colors.white),
+            style: theme.textTheme.labelLarge?.copyWith(
+              color: scheme.onSecondaryContainer,
+            ),
           ),
         ),
       ),

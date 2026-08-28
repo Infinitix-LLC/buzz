@@ -7,12 +7,6 @@ library;
 /// One signed event to the relay, then a copy to every member — and the same
 /// path whether the sender is a person or an agent.
 const String kMessageFanoutScript = r'''
-const INK = Color(0xFFE8F0FA);
-const MUTED = Color(0xFF93A9C4);
-const BLUE = Color(0xFF4C9AFF);
-const GREEN = Color(0xFF35D07F);
-const ORANGE = Color(0xFFFFA62B);
-const PANEL = Color(0xFF142235);
 
 const WIDE = 1.0;
 const NEAR = 1.5;

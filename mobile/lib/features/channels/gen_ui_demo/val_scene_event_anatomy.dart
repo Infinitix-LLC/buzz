@@ -8,11 +8,6 @@ library;
 /// its fields arrive one at a time, then pulls back for the point about the
 /// signature.
 const String kEventAnatomyScript = r'''
-const INK = Color(0xFFE8F0FA);
-const MUTED = Color(0xFF93A9C4);
-const BLUE = Color(0xFF4C9AFF);
-const GREEN = Color(0xFF35D07F);
-const PANEL = Color(0xFF142235);
 
 const WIDE = 1.0;
 const NEAR = 1.5;
