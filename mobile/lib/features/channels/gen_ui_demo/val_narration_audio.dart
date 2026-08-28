@@ -41,6 +41,9 @@ const Map<String, String> kNarrationClips = {
   'Every message is one small, signed record.': 'c92199e46fcb.mp3',
   'Who sent it, where, what it said, and when.': '6ae9b0a43b9b.mp3',
   'Change one character and the signature stops matching.': 'f75e9f2b335f.mp3',
+  'Shipped. The whole thread is the record of why.': '76c4785be817.mp3',
+  'You ask for a change, and it picks the same thread straight back up.':
+      '81aa317aaddb.mp3',
 };
 
 /// How long each clip runs, in milliseconds.
@@ -74,6 +77,8 @@ const Map<String, int> kNarrationDurationsMs = {
   'Every message is one small, signed record.': 2229,
   'Who sent it, where, what it said, and when.': 2229,
   'Change one character and the signature stops matching.': 2972,
+  'Shipped. The whole thread is the record of why.': 2554,
+  'You ask for a change, and it picks the same thread straight back up.': 3808,
 };
 
 /// Total speech time for [texts], in milliseconds. Unknown lines count zero.

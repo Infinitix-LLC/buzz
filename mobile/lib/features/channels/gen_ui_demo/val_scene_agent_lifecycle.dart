@@ -99,7 +99,6 @@ const c2 = captionFor("You ask for something, the way you would ask a person.", 
 const c3 = captionFor("An agent in that channel picks it up.", 0, -20, MID);
 const c4 = captionFor("It works in the open. Everyone can watch.", 700, -20, NEAR);
 const c5 = captionFor("It reports back into the same channel.", 0, -20, MID);
-const c6 = captionFor("No dashboard. The conversation is the record.", 0, 0, WIDE);
 
 // --- the establishing shot ------------------------------------------------
 await Scene.play([Scene.create(title, Duration(0.7))]);
@@ -222,14 +221,80 @@ await Scene.pause(Duration(0.4));
 const n5 = Scene.narrate("It reports back into the same channel.");
 await Scene.play([n5.start()]);
 
-// --- pull back for the point ------------------------------------------------
+''';
+
+/// What plays after the viewer chooses "Ship it".
+///
+/// A *continuation*, not a scene: `playBeat` runs it on the same executor, so
+/// every object, colour and helper the main scene declared is still in scope.
+///
+/// It must therefore declare **nothing** the main scene already declared —
+/// re-declaring a `const` on an executor that already has it aborts the beat at
+/// instruction 0 with a bare "Runtime error", and the symptom is a branch that
+/// compiles, runs, resolves, and draws absolutely nothing.
+///
+/// It also cannot be run on its own.
+const String kAgentLifecycleShipScript = r'''
+const shipStamp = new Rectangle(300, 100);
+shipStamp.setColor(GREEN);
+shipStamp.setFillColor(PANEL);
+shipStamp.setFillOpacity(1.0);
+shipStamp.setStroke(5);
+shipStamp.moveTo(Vector(0, -300));
+
+const shipText = new Text("merged to main", 270);
+shipText.setColor(GREEN);
+shipText.setScale(1.5);
+shipText.moveTo(Vector(0, -300));
+
+const shipCap = captionFor("Shipped. The thread is the record of why.", 0, 0, WIDE);
+
 await Scene.play([Scene.unCreate(c5, Duration(0.25))]);
 await focusOn(0, 0, WIDE);
+await Scene.play([Scene.create(title, Duration(0.45))]);
 await Scene.play([
-  Scene.create(title, Duration(0.45)),
-  Scene.create(c6, Duration(0.45)),
+  Scene.create(shipStamp, Duration(0.5)),
+  Scene.create(shipText, Duration(0.5)),
 ]);
-await Scene.pause(Duration(0.3));
-const n6 = Scene.narrate("No dashboard. The conversation is the record.");
-await Scene.play([n6.start()]);
+await Scene.play([Scene.flashAround(shipStamp, Duration(0.9))]);
+await Scene.play([Scene.create(shipCap, Duration(0.45))]);
+await Scene.pause(Duration(0.4));
+const shipNarration = Scene.narrate("Shipped. The whole thread is the record of why.");
+await Scene.play([shipNarration.start()]);
+''';
+
+/// What plays after the viewer chooses "Ask for changes".
+///
+/// The same continuation contract as [kAgentLifecycleShipScript].
+const String kAgentLifecycleReviseScript = r'''
+const reviseNote = new Rectangle(320, 100);
+reviseNote.setColor(ORANGE);
+reviseNote.setFillColor(PANEL);
+reviseNote.setFillOpacity(1.0);
+reviseNote.setStroke(5);
+reviseNote.moveTo(Vector(0, -300));
+
+const reviseText = new Text("add a test for it", 290);
+reviseText.setColor(ORANGE);
+reviseText.setScale(1.5);
+reviseText.moveTo(Vector(0, -300));
+
+const reviseCap = captionFor("It picks the same thread straight back up.", 0, 0, WIDE);
+
+await Scene.play([Scene.unCreate(c5, Duration(0.25))]);
+await focusOn(0, 0, WIDE);
+await Scene.play([Scene.create(title, Duration(0.45))]);
+await Scene.play([
+  Scene.create(reviseNote, Duration(0.5)),
+  Scene.create(reviseText, Duration(0.5)),
+]);
+await Scene.play([
+  reviseNote.animatedMoveTo(Vector(700, -20), Duration(1.1)),
+  reviseText.animatedMoveTo(Vector(700, -20), Duration(1.1)),
+  Scene.showPassingFlash(reviseNote, Duration(1.1)),
+]);
+await Scene.play([Scene.create(reviseCap, Duration(0.45))]);
+await Scene.pause(Duration(0.4));
+const reviseNarration = Scene.narrate("You ask for a change, and it picks the same thread straight back up.");
+await Scene.play([reviseNarration.start()]);
 ''';

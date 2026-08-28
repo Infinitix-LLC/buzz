@@ -31,6 +31,7 @@ class ValLocalScene extends StatefulWidget {
     this.autoplay = true,
     this.precompiled,
     this.title,
+    this.followUps = const <String, String>{},
   });
 
   final String script;
@@ -63,6 +64,18 @@ class ValLocalScene extends StatefulWidget {
   /// which is no help before it has started.
   final String? title;
 
+  /// Continuations offered when the scene reaches its end, label to script.
+  ///
+  /// Each one plays as a further *beat* on the same player. `playBeat` is
+  /// cumulative — a later beat runs on the executor the first one used, so it
+  /// inherits every object already on stage and can move and recolour them.
+  /// That is what makes this a branch in one continuous animation rather than a
+  /// second video: the scene genuinely carries on from where the viewer chose.
+  ///
+  /// A continuation therefore cannot stand alone; it assumes the main script
+  /// has run. Empty means the scene simply offers a replay.
+  final Map<String, String> followUps;
+
   @override
   State<ValLocalScene> createState() => _ValLocalSceneState();
 }
@@ -81,6 +94,9 @@ class _ValLocalSceneState extends State<ValLocalScene>
   late _Stage _stage = widget.autoplay ? _Stage.compiling : _Stage.idle;
   String? _error;
   bool _finished = false;
+
+  /// Set once a continuation has been chosen, so the choice is offered once.
+  bool _branched = false;
 
   /// Bumped on every start, so a future belonging to a superseded run can tell
   /// that it no longer speaks for the widget.
@@ -117,6 +133,7 @@ class _ValLocalSceneState extends State<ValLocalScene>
       _stage = _Stage.compiling;
       _error = null;
       _finished = false;
+      _branched = false;
     });
     _start();
   }
@@ -292,6 +309,54 @@ class _ValLocalSceneState extends State<ValLocalScene>
     }
   }
 
+  /// Plays [script] as a further beat on the player already on screen.
+  Future<void> _playFollowUp(String script) async {
+    final player = _player;
+    if (player == null) {
+      return;
+    }
+    final run = _run;
+    setState(() {
+      _branched = true;
+      _finished = false;
+    });
+    try {
+      final program = await compileValScript(
+        script,
+        frame: widget.frame,
+        previousScript: widget.script,
+      );
+      if (!mounted || run != _run) {
+        return;
+      }
+      final spoken = await ValNarrationAudio.seed(
+        player,
+        program.narrations.keys,
+      );
+      final allSpoken = spoken == program.narrations.length;
+      final speechMs = narrationTotalMs(program.narrations.keys);
+      final startedAt = DateTime.now();
+      if (!allSpoken && !program.hasNarrationAudio) {
+        await player.useSyntheticNarrationTiming(
+          program.narrations.keys,
+          wordsPerMinute: 110,
+        );
+      }
+      unawaited(
+        player
+            .playBeat(
+              program.instructions,
+              allSpoken
+                  ? const <String, Map<String, Object?>>{}
+                  : program.narrations,
+            )
+            .then((_) => _settle(player, run, speechMs, startedAt)),
+      );
+    } on Object catch (e) {
+      _fail(e.toString());
+    }
+  }
+
   void _log(String message) => debugPrint('VAL script: $message');
 
   /// The engine reports a runtime fault and keeps its remaining instructions
@@ -332,7 +397,14 @@ class _ValLocalSceneState extends State<ValLocalScene>
               _LocalCanvas(player: player!, background: widget.background),
               // Only once the script has run out: a replay control competing
               // with the animation would pull the eye off it.
-              if (_finished) _ReplayOverlay(onReplay: _restart),
+              if (_finished)
+                if (widget.followUps.isNotEmpty && !_branched)
+                  _ChoiceOverlay(
+                    choices: widget.followUps,
+                    onChoose: _playFollowUp,
+                  )
+                else
+                  _ReplayOverlay(onReplay: _restart),
             ],
           ),
         },
@@ -592,6 +664,88 @@ class _ReplayOverlay extends StatelessWidget {
                 ),
               ),
             ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The question the scene stops to ask, and the answers it will act on.
+///
+/// Deliberately the same visual language as the replay overlay: the scene dims
+/// and the controls sit in the middle, so "it has paused for you" reads the
+/// same way whether what follows is a branch or a replay.
+class _ChoiceOverlay extends StatelessWidget {
+  const _ChoiceOverlay({required this.choices, required this.onChoose});
+
+  final Map<String, String> choices;
+  final void Function(String script) onChoose;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Positioned.fill(
+      child: ColoredBox(
+        color: Colors.black.withValues(alpha: 0.45),
+        child: Center(
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'What do you do?',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      color: Colors.white,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      for (final entry in choices.entries) ...[
+                        _ChoiceChip(
+                          label: entry.key,
+                          onTap: () => onChoose(entry.value),
+                        ),
+                        const SizedBox(width: 10),
+                      ],
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ChoiceChip extends StatelessWidget {
+  const _ChoiceChip({required this.label, required this.onTap});
+
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Material(
+      color: Colors.white.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(999),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(999),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+          child: Text(
+            label,
+            style: theme.textTheme.labelLarge?.copyWith(color: Colors.white),
           ),
         ),
       ),

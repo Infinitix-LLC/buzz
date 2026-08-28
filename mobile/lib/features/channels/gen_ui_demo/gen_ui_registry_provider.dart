@@ -64,6 +64,7 @@ final genUiRegistryProvider = Provider<GenUiRegistry>((ref) {
     // reads as part of the answer instead of as an attachment to open, so the
     // demo uses the local engine everywhere and ignores `id` entirely.
     ..register('val_scene', (context, model) {
+      final scene = genUiString(model.attributes['scene']);
       final frame = genUiString(model.attributes['frame']) ?? 'landscape';
       return AspectRatio(
         aspectRatio: switch (frame) {
@@ -75,10 +76,11 @@ final genUiRegistryProvider = Provider<GenUiRegistry>((ref) {
         // and autoplaying them all runs that many engines at once while each
         // one finishes before it is scrolled to.
         child: ValLocalScene(
-          script: valDemoScript(genUiString(model.attributes['scene'])),
+          script: valDemoScript(scene),
           frame: frame,
           autoplay: false,
           title: genUiString(model.attributes['name']),
+          followUps: valDemoFollowUps(scene),
         ),
       );
     });

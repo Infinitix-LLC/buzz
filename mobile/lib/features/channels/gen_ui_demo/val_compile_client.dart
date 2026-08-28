@@ -66,6 +66,7 @@ Future<CompiledValProgram> compileValScript(
   String? endpoint,
   http.Client? client,
   Duration timeout = const Duration(seconds: 60),
+  String? previousScript,
 }) async {
   final transport = client ?? http.Client();
   try {
@@ -76,6 +77,13 @@ Future<CompiledValProgram> compileValScript(
           body: jsonEncode({
             'script': script,
             if (frame != null && frame.isNotEmpty) 'frame': frame,
+            // A continuation is compiled against the scene it continues.
+            // Alone it does not compile at all: it deliberately re-uses the
+            // colours, helpers and objects the first script declared, and the
+            // compiler rightly rejects those as undefined. The endpoint runs
+            // `previousScript` first so the names exist.
+            if (previousScript != null && previousScript.isNotEmpty)
+              'previousScript': previousScript,
           }),
         )
         .timeout(timeout);

@@ -37,3 +37,17 @@ const Map<String, String> kValDemoScenes = {
 /// The script for [name], or the handshake when [name] is unknown or absent.
 String valDemoScript(String? name) =>
     kValDemoScenes[name] ?? kNip42HandshakeScript;
+
+/// Continuations a scene offers when it reaches its decision point.
+///
+/// Only `agent_lifecycle` branches: it is the one scene whose story has a
+/// genuine fork — a reviewer either ships the agent's work or sends it back —
+/// and putting a choice anywhere it does not belong would be decoration rather
+/// than explanation.
+Map<String, String> valDemoFollowUps(String? name) => switch (name) {
+  'agent_lifecycle' => const {
+    'Ship it': kAgentLifecycleShipScript,
+    'Ask for changes': kAgentLifecycleReviseScript,
+  },
+  _ => const <String, String>{},
+};
