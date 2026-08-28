@@ -11,6 +11,7 @@ import UserNotifications
   private var concentricSheetSurfaceChannel: FlutterMethodChannel?
   private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
   private var nativeEmojiPickerCoordinator: NativeEmojiPickerCoordinator?
+  private var nativeProfileTextEditorCoordinator: NativeProfileTextEditorCoordinator?
   private var nativeMessageActionSurfaceSupportChannel: FlutterMethodChannel?
   private var huddleMediaPlugin: HuddleMediaPlugin?
 
@@ -110,12 +111,39 @@ import UserNotifications
       )
     }
 
+    if let segmentedControlRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzNativeSegmentedControl"
+    ) {
+      segmentedControlRegistrar.register(
+        NativeSegmentedControlFactory(messenger: messenger),
+        withId: "buzz/native_segmented_control"
+      )
+    }
+
+    if let skinToneRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzNativeSkinToneControl"
+    ) {
+      skinToneRegistrar.register(
+        NativeSkinToneControlFactory(messenger: messenger),
+        withId: "buzz/native_skin_tone_control"
+      )
+    }
+
     if let stickyDateGlassRegistrar = engineBridge.pluginRegistry.registrar(
       forPlugin: "BuzzStickyDateGlassHeader"
     ) {
       stickyDateGlassRegistrar.register(
         StickyDateGlassHeaderFactory(messenger: messenger),
         withId: "buzz/sticky_date_glass"
+      )
+    }
+
+    if let themePaginationGlassRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzThemePaginationGlassControl"
+    ) {
+      themePaginationGlassRegistrar.register(
+        ThemePaginationGlassControlFactory(messenger: messenger),
+        withId: "buzz/theme_pagination_glass"
       )
     }
 
@@ -133,6 +161,14 @@ import UserNotifications
     nativeEmojiPickerCoordinator = NativeEmojiPickerCoordinator(
       messenger: messenger,
       parentViewController: nativeEmojiPickerRegistrar?.viewController
+    )
+
+    let nativeProfileTextEditorRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzNativeProfileTextEditor"
+    )
+    nativeProfileTextEditorCoordinator = NativeProfileTextEditorCoordinator(
+      messenger: messenger,
+      parentViewController: nativeProfileTextEditorRegistrar?.viewController
     )
     if #available(iOS 16.0, *),
       let nativeMessageActionsRegistrar = engineBridge.pluginRegistry.registrar(
