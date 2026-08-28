@@ -71,7 +71,15 @@ final genUiRegistryProvider = Provider<GenUiRegistry>((ref) {
           'square' => 1,
           _ => 16 / 9,
         },
-        child: ValLocalScene(script: kNip42HandshakeScript, frame: frame),
+        // Tap to start, never on build: a transcript can hold several scenes,
+        // and autoplaying them all runs that many engines at once while each
+        // one finishes before it is scrolled to.
+        child: ValLocalScene(
+          script: valDemoScript(genUiString(model.attributes['scene'])),
+          frame: frame,
+          autoplay: false,
+          title: genUiString(model.attributes['name']),
+        ),
       );
     });
 });

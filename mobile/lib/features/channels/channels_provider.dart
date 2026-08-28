@@ -130,6 +130,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
   /// while the relay is still connecting, which is exactly when someone opens
   /// the app to demo it.
   List<Channel> _withShowcase(List<Channel> channels) {
+    if (!showcaseEnabled) return channels;
     if (channels.any((c) => c.id == showcaseChannelId)) return channels;
     final pubkey = ref.read(myPubkeyProvider) ?? '';
     return [showcaseChannel(pubkey), ...channels];

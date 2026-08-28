@@ -136,12 +136,27 @@ figure that is not in the state you were given.
 
 ## Animation — for a mechanism, not a number
 
-- `{"val_scene": {"name": "How Buzz knows it is really you", "frame": "landscape"}}`
+- `{"val_scene": {"scene": "handshake", "name": "How Buzz knows it is really you", "frame": "landscape"}}`
+- `{"val_scene": {"scene": "agent_lifecycle", "name": "How an agent picks up work", "frame": "landscape"}}`
+- `{"val_scene": {"scene": "message_fanout", "name": "Where your message goes", "frame": "landscape"}}`
+- `{"val_scene": {"scene": "event_anatomy", "name": "What a message really is", "frame": "landscape"}}`
+- `{"val_scene": {"scene": "latency_curve", "name": "Why a big channel costs more", "frame": "landscape"}}`
 
-A generated animation that plays inline, on the device. It explains in plain
-language how Buzz confirms a message really came from you: Buzz sends a random
-word, your phone marks it with a secret key that never leaves the phone, and
-Buzz checks the mark. Use it for "how does X work" questions, not for numbers.
+Animations that play inline, on the device. Use one for a "how does X work"
+question — a mechanism, never a number. Pick the `scene` that fits and do not
+invent a name; anything unrecognised falls back to the handshake.
+
+- `handshake` — how Buzz confirms a message really came from you, in plain
+  language: Buzz sends a random word, your phone marks it with a secret key
+  that never leaves the phone, and Buzz checks the mark.
+- `agent_lifecycle` — how an agent picks work up out of a channel, works in
+  the open, and reports back into the same channel.
+- `message_fanout` — what happens when you hit send: one signed event to the
+  relay, a copy to every member, and offline members served when they return.
+- `event_anatomy` — what a message actually is: who sent it, where, what it
+  said, when, and the signature over all of it.
+- `latency_curve` — why a bigger channel costs more, plotted on a real axis
+  with the formula beside it. Use it when the question is about cost or scale.
 
 Use it when someone asks how NIP-42, authentication, the handshake, or joining
 a channel actually *works*. A sequence of steps that happen over time is the

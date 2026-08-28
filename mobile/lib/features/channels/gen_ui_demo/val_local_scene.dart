@@ -9,6 +9,7 @@ import 'package:val_player/val_player.dart'
     hide Color, Colors, Offset, Radius, Rect, Size;
 
 import 'val_compile_client.dart';
+import 'val_narration_audio.dart';
 
 /// Runs a VAL script on the device.
 ///
@@ -29,6 +30,7 @@ class ValLocalScene extends StatefulWidget {
     this.background = const Color(0xFF0E0E12),
     this.autoplay = true,
     this.precompiled,
+    this.title,
   });
 
   final String script;
@@ -47,25 +49,51 @@ class ValLocalScene extends StatefulWidget {
   final String frame;
 
   final Color background;
+
+  /// Whether the scene compiles and plays as soon as it is built.
+  ///
+  /// False shows a poster and waits for a tap, which is what a scene inside a
+  /// scrollable transcript wants: several autoplaying scenes run their engines
+  /// at once, and a scene that starts when it is built has usually finished by
+  /// the time it is scrolled into view. Waiting for the tap also defers the
+  /// compile, so scrolling past a scene costs nothing at all.
   final bool autoplay;
+
+  /// Shown on the poster. The scene's own title is drawn inside the animation,
+  /// which is no help before it has started.
+  final String? title;
 
   @override
   State<ValLocalScene> createState() => _ValLocalSceneState();
 }
 
-enum _Stage { compiling, running, failed }
+enum _Stage { idle, compiling, running, failed }
 
+/// Uses the plural [TickerProviderStateMixin] deliberately.
+///
+/// "Show again" disposes the finished player and builds a new one, and each
+/// player creates its own ticker. `SingleTickerProviderStateMixin` records the
+/// first ticker and never clears that field — not even when the ticker is
+/// disposed — so the second player throws "multiple tickers were created"
+/// however carefully the first was torn down.
 class _ValLocalSceneState extends State<ValLocalScene>
-    with SingleTickerProviderStateMixin {
-  _Stage _stage = _Stage.compiling;
+    with TickerProviderStateMixin {
+  late _Stage _stage = widget.autoplay ? _Stage.compiling : _Stage.idle;
   String? _error;
+  bool _finished = false;
+
+  /// Bumped on every start, so a future belonging to a superseded run can tell
+  /// that it no longer speaks for the widget.
+  int _run = 0;
   int _instructionCount = 0;
   vf.LocalEnginePlayer? _player;
 
   @override
   void initState() {
     super.initState();
-    _start();
+    if (widget.autoplay) {
+      _start();
+    }
   }
 
   @override
@@ -88,6 +116,7 @@ class _ValLocalSceneState extends State<ValLocalScene>
     setState(() {
       _stage = _Stage.compiling;
       _error = null;
+      _finished = false;
     });
     _start();
   }
@@ -111,11 +140,19 @@ class _ValLocalSceneState extends State<ValLocalScene>
 
   Future<void> _start() async {
     _bootstrapVal();
+    final run = ++_run;
+    if (mounted && _stage != _Stage.compiling) {
+      setState(() {
+        _stage = _Stage.compiling;
+        _error = null;
+        _finished = false;
+      });
+    }
     try {
       final program =
           widget.precompiled ??
           await compileValScript(widget.script, frame: widget.frame);
-      if (!mounted) {
+      if (!mounted || run != _run) {
         return;
       }
 
@@ -141,20 +178,117 @@ class _ValLocalSceneState extends State<ValLocalScene>
       // TTS fetch, and when that fails the engine cancels every pending cue, so
       // the scene freezes half-drawn. Synthetic timing keeps the beats paced;
       // muting alone would collapse them all onto one frame.
-      if (!program.hasNarrationAudio) {
-        await player.useSyntheticNarrationTiming(program.narrations.keys);
+      // Pre-rendered speech ships with the app, because the engine's own
+      // narration endpoint is not deployed. When every line of this scene has a
+      // clip, seed them and let the normal audio path run: the beat then ends
+      // when the sentence actually ends, which no estimate can match.
+      final spoken = await ValNarrationAudio.seed(
+        player,
+        program.narrations.keys,
+      );
+      final allSpoken = spoken == program.narrations.length;
+      final speechMs = narrationTotalMs(program.narrations.keys);
+      final startedAt = DateTime.now();
+
+      if (!allSpoken && !program.hasNarrationAudio) {
+        await player.useSyntheticNarrationTiming(
+          program.narrations.keys,
+          // Slower than conversational speech on purpose: the narration is
+          // silent here, so this is a reading pace for the caption on screen,
+          // not a speaking pace. The package default (155) finishes the scene
+          // in about twelve seconds, which reads as rushed.
+          wordsPerMinute: 110,
+        );
       }
 
-      if (widget.autoplay) {
-        // Not awaited into the build: the engine runs for the length of the
-        // animation, and the future completes when the script ends, not when
-        // it starts painting.
-        unawaited(player.playBeat(program.instructions, program.narrations));
-      }
+      // Unconditional: `_start` is only ever reached because playback was
+      // asked for — on build when [ValLocalScene.autoplay] is set, otherwise
+      // from the poster or the replay control. Gating this on `autoplay` too
+      // made a tapped scene compile, build its player, swap the poster for the
+      // canvas, and then sit there painting nothing.
+      //
+      // Not awaited into the build: the engine runs for the length of the
+      // animation, and the future completes when the script ends, not when it
+      // starts painting.
+      unawaited(
+        player
+            .playBeat(
+              program.instructions,
+              // Emptied when our own clips are in place. `playArtifact` seeds
+              // the artifact's narrations on the way in, and the compiler
+              // returns those as `{<text>: {}}` placeholders — so passing them
+              // re-seeds every line with an empty audio url and overwrites the
+              // clip we just registered. The symptom is `UrlSource(url: )`.
+              allSpoken
+                  ? const <String, Map<String, Object?>>{}
+                  : program.narrations,
+            )
+            .then((_) => _settle(player, run, speechMs, startedAt)),
+      );
     } on ValCompileException catch (e) {
       _fail(e.message);
     } catch (e) {
       _fail(e.toString());
+    }
+  }
+
+  /// Waits for the scene to actually end, then offers "Show again".
+  ///
+  /// Two conditions, because neither is sufficient alone.
+  ///
+  /// `playBeat` resolves when the instruction list has been executed, which for
+  /// a narrated scene is a few seconds in — long before the speech it queued
+  /// has finished. And frame activity goes quiet *during* every narration hold,
+  /// since a held picture publishes no frames, so "no new frames" on its own
+  /// fires between beats. Waiting for the summed clip length AND a quiet
+  /// stretch gets it right; waiting for either one alone put the control on
+  /// screen around eight seconds into a forty-second scene.
+  Future<void> _settle(
+    vf.LocalEnginePlayer player,
+    int run,
+    int speechMs,
+    DateTime startedAt,
+  ) async {
+    const step = Duration(milliseconds: 200);
+    // Comfortably longer than the longest narration clip (3.0s), because a
+    // held picture publishes no frames — so any threshold under that fires
+    // between beats rather than at the end. Erring late is the right side to
+    // err on: a control that appears a beat after the scene rests is
+    // unremarkable, one that appears mid-scene looks broken.
+    const quiet = Duration(milliseconds: 4500);
+    const limit = Duration(seconds: 150);
+
+    var lastFrameAt = DateTime.now();
+    void onFrame() => lastFrameAt = DateTime.now();
+    player.display.addListener(onFrame);
+
+    try {
+      final speech = Duration(milliseconds: speechMs);
+      while (true) {
+        await Future<void>.delayed(step);
+        if (!mounted || run != _run) {
+          return;
+        }
+        final elapsed = DateTime.now().difference(startedAt);
+        if (elapsed > limit) {
+          break;
+        }
+        final spoken = elapsed >= speech;
+        final settled = DateTime.now().difference(lastFrameAt) >= quiet;
+        if (spoken && settled && !player.hasActiveAnimations) {
+          break;
+        }
+      }
+    } finally {
+      player.display.removeListener(onFrame);
+    }
+
+    // Checked against the run this future belongs to: "Show again" starts a new
+    // player while the previous one's future is still outstanding, and that
+    // future resolves regardless of the disposal. Without the guard it marks
+    // the *new* run finished the moment the old one ends.
+    if (mounted && run == _run) {
+      setState(() => _finished = true);
     }
   }
 
@@ -186,14 +320,20 @@ class _ValLocalSceneState extends State<ValLocalScene>
       child: DecoratedBox(
         decoration: BoxDecoration(color: widget.background),
         child: switch (_stage) {
+          _Stage.idle => _Poster(title: widget.title, onPlay: _start),
           _Stage.compiling => const _Centered(child: _Compiling()),
           _Stage.failed => _Centered(child: _Failed(message: _error)),
           _Stage.running when player == null => const _Centered(
             child: _Compiling(),
           ),
-          _Stage.running => _LocalCanvas(
-            player: player!,
-            background: widget.background,
+          _Stage.running => Stack(
+            fit: StackFit.expand,
+            children: [
+              _LocalCanvas(player: player!, background: widget.background),
+              // Only once the script has run out: a replay control competing
+              // with the animation would pull the eye off it.
+              if (_finished) _ReplayOverlay(onReplay: _restart),
+            ],
           ),
         },
       ),
@@ -318,6 +458,142 @@ class _Failed extends StatelessWidget {
             overflow: TextOverflow.ellipsis,
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// The tap target shown before a scene has been started.
+///
+/// Deliberately not a play button on a black rectangle. This is not a video —
+/// nothing is streamed, nothing is buffered, and there is no file. A play
+/// triangle sets the wrong expectation about what the thing is, and invites
+/// the wrong question ("how big is it?", "does it work offline?"). A worded
+/// invitation reads as part of the answer instead.
+class _Poster extends StatelessWidget {
+  const _Poster({required this.onPlay, this.title});
+
+  final VoidCallback onPlay;
+  final String? title;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final name = title;
+    return InkWell(
+      onTap: onPlay,
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (name != null && name.isNotEmpty) ...[
+                Text(
+                  name,
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 14),
+              ],
+              // A scene can be laid out narrow — a reels frame, or a phone in
+              // portrait — and the pill is a fixed-width row, so it must be
+              // allowed to shrink rather than overflow its own poster.
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.10),
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.22),
+                    ),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 9,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'See how it works',
+                          style: theme.textTheme.labelLarge?.copyWith(
+                            color: Colors.white,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        const Icon(
+                          Icons.arrow_forward_rounded,
+                          size: 16,
+                          color: Colors.white70,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Offered once the scene has played through.
+///
+/// A dimming overlay with the control in the middle, rather than a corner
+/// button. Every corner is occupied by the scene itself — the title runs along
+/// the top and the closing caption along the bottom — so a corner control
+/// landed on top of one or the other. Covering the frame also makes the state
+/// unambiguous: the scene has ended, and this is what to do about it.
+class _ReplayOverlay extends StatelessWidget {
+  const _ReplayOverlay({required this.onReplay});
+
+  final VoidCallback onReplay;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Positioned.fill(
+      child: GestureDetector(
+        onTap: onReplay,
+        child: ColoredBox(
+          color: Colors.black.withValues(alpha: 0.45),
+          child: Center(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.24),
+                  ),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 18,
+                    vertical: 9,
+                  ),
+                  child: Text(
+                    'Show again',
+                    style: theme.textTheme.labelLarge?.copyWith(
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }

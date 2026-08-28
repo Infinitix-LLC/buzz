@@ -411,12 +411,11 @@ void main() {
   });
 
   group('val_scene directive', () {
-    testWidgets('plays inline rather than offering a poster to open', (
-      tester,
-    ) async {
-      // The demo deliberately drops the streamed poster-and-sheet presentation,
-      // including for a payload carrying an artifact `id`: a scene that plays
-      // where it lands reads as part of the answer, not as an attachment.
+    testWidgets('waits for a tap and then plays in place', (tester) async {
+      // Two things at once. The scene is never opened in a sheet — it plays
+      // where it lands — and it does not start on build: a transcript can hold
+      // several scenes, and autoplaying them runs that many engines at once
+      // while each finishes before it is scrolled to.
       await pumpBoard(
         tester,
         'Easier to watch.\n\n'
@@ -426,16 +425,32 @@ void main() {
       );
 
       expect(find.byType(ValLocalScene), findsOneWidget);
-      expect(find.byIcon(Icons.play_arrow_rounded), findsNothing);
+      expect(
+        find.text('See how it works'),
+        findsOneWidget,
+        reason: 'the invitation is the start control, not a play button',
+      );
+      // The poster names the scene, since its own title is drawn inside the
+      // animation and is no help before it runs.
+      expect(find.text('NIP-42 Authentication Handshake'), findsOneWidget);
       expect(find.textContaining('Easier to watch'), findsWidgets);
     });
 
-    testWidgets('a payload with no id plays inline too', (tester) async {
+    testWidgets('tapping the poster starts it inline, not in a sheet', (
+      tester,
+    ) async {
       await pumpBoard(
         tester,
         wrapGenUi('{"val_scene": {"name": "Scene", "frame": "landscape"}}'),
       );
 
+      await tester.tap(find.text('See how it works'));
+      await tester.pump();
+
+      // It leaves the poster for the compiling state, and does so in place:
+      // no sheet is presented, the same scene widget is still in the tree.
+      expect(find.text('See how it works'), findsNothing);
+      expect(find.byType(BottomSheet), findsNothing);
       expect(find.byType(ValLocalScene), findsOneWidget);
     });
   });

@@ -1674,11 +1674,9 @@ packages:
   val_flutter:
     dependency: "direct main"
     description:
-      path: "."
-      ref: demo
-      resolved-ref: d87dbb8ec0240ae4df0d3f11c78b23e6eb8d9038
-      url: "git@github.com:Infinitix-LLC/val_flutter.git"
-    source: git
+      path: "/Users/sohag/Projects/gate/val_flutter"
+      relative: false
+    source: path
     version: "0.0.2"
   val_player:
     dependency: "direct main"

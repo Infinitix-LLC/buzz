@@ -49,7 +49,7 @@ class ChannelMessagesNotifier extends Notifier<AsyncValue<List<NostrEvent>>> {
     // The showcase thread is scripted and never reaches the relay, so it must
     // answer before anything here waits on a session — otherwise it shows a
     // spinner until a connection it does not need comes up.
-    if (channelId == showcaseChannelId) {
+    if (showcaseEnabled && channelId == showcaseChannelId) {
       return AsyncData(showcaseMessages(ref.watch(myPubkeyProvider) ?? ''));
     }
 

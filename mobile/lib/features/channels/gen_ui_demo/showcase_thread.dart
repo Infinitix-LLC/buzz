@@ -11,11 +11,21 @@
 /// looks like on its own rather than to build a dashboard.
 library;
 
+import 'dart:io';
+
 import '../../../shared/relay/nostr_models.dart';
 import '../channel.dart';
 
 /// Channel id. Not a relay id — nothing will ever resolve it there.
 const String showcaseChannelId = 'showcase-genui-thread';
+
+/// Whether to splice the showcase channel into the channel list.
+///
+/// Off under `flutter test`. The channel-list tests assert their exact
+/// contents, and a demo channel appearing in all of them fails nine of those
+/// tests for a reason that has nothing to do with what they cover. Gating here
+/// keeps the suite honest about the filtering logic it is actually testing.
+bool get showcaseEnabled => !Platform.environment.containsKey('FLUTTER_TEST');
 
 /// The bot's pubkey. Fixed so its avatar colour and initials stay put.
 const String showcaseBotPubkey =
@@ -77,9 +87,39 @@ Everything is clear except the scope check. Your call.'''),
     '''
 Easier to watch than to read.
 
-${_g('{"val_scene": {"name": "How Buzz knows it is really you", "frame": "landscape"}}')}
+${_g('{"val_scene": {"scene": "handshake", "name": "How Buzz knows it is really you", "frame": "landscape"}}')}
 
 That runs on the device — the script ships in the app and the engine draws every frame here.''',
+  ),
+
+  const _Turn.ask('How does an agent actually pick up work?'),
+  _Turn.answer(
+    '''
+${_g('{"val_scene": {"scene": "agent_lifecycle", "name": "How an agent picks up work", "frame": "landscape"}}')}
+
+That is the whole loop. An agent is a member of the channel, not a service behind a dashboard.''',
+  ),
+
+  const _Turn.ask('What happens when I hit send?'),
+  _Turn.answer(
+    '''
+${_g('{"val_scene": {"scene": "message_fanout", "name": "Where your message goes", "frame": "landscape"}}')}
+
+One signed event in, a copy to each member out — and the same path whether the sender is a person or an agent.''',
+  ),
+
+  const _Turn.ask('What actually is a message here?'),
+  _Turn.answer('''
+${_g('{"val_scene": {"scene": "event_anatomy", "name": "What a message really is", "frame": "landscape"}}')}
+
+Five fields and a signature. That is the whole unit Buzz moves around.'''),
+
+  const _Turn.ask('Why does a bigger channel cost more to run?'),
+  _Turn.answer(
+    '''
+${_g('{"val_scene": {"scene": "latency_curve", "name": "Why a big channel costs more", "frame": "landscape"}}')}
+
+The axis, the curve and the formula are all drawn on the device — none of it is an image.''',
   ),
 
   const _Turn.ask('How has message volume been trending?'),
@@ -96,15 +136,9 @@ Agent traffic tripled this week.'''),
 
   const _Turn.ask('What share of that is agents versus people?'),
   _Turn.answer('''
-${_g('{"pie_chart": {"title": "Who is talking", "values": [{"label": "People", "value": 62, "color": "#4C9AFF"}, {"label": "Agents", "value": 28, "color": "#35D07F"}, {"label": "Webhooks", "value": 10, "color": "#FFA62B"}], "height": 260}}')}
+${_g('{"pie_chart": {"title": "Who is talking", "values": [{"label": "People", "value": 62, "color": "#4C9AFF"}, {"label": "Agents", "value": 28, "color": "#35D07F"}, {"label": "Webhooks", "value": 20, "color": "#FFA62B"}], "height": 260}}')}
 
-Just over a quarter of all traffic is now non-human.'''),
-
-  const _Turn.ask('Give me the headline numbers.'),
-  _Turn.answer('''
-${_g('{"metric_grid": {"title": "This week", "values": [{"label": "Active members", "value": "412", "delta": "+38", "color": "#35D07F"}, {"label": "P95 relay latency", "value": "84 ms", "delta": "-12 ms", "color": "#4C9AFF"}, {"label": "Failed auths", "value": "3", "delta": "-27"}], "height": 180}}')}
-
-Failed auths dropped once the challenge window widened.'''),
+More than four in ten messages are now non-human.'''),
 
   const _Turn.ask('How close are the release blockers to done?'),
   _Turn.answer('''
@@ -132,7 +166,7 @@ Three steps, and the middle one is where most people stop worrying.'''),
 
   const _Turn.ask('What does our relay latency curve look like under load?'),
   _Turn.answer('''
-${_g('{"plot_latex": {"title": "Queue delay against load", "equation": "x^2"}}')}
+${_g('{"plot_latex": {"title": "Queue delay", "equation": "x^2"}}')}
 
 Delay grows with the square of queue depth, which is why we shed early.'''),
 
