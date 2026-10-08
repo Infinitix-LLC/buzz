@@ -328,6 +328,29 @@ Finder _anyRichText() {
   );
 }
 
+/// The link spans whose label is exactly [label].
+///
+/// Links render as [LinkTextSpan]s inside the paragraph rather than as
+/// widgets of their own, so `find.text` cannot see them. Not `visitChildren`:
+/// it only visits spans that carry their own text, and a link wrapping its
+/// parsed label carries none.
+List<LinkTextSpan> _linkSpans(WidgetTester tester, String label) {
+  final links = <LinkTextSpan>[];
+  void walk(InlineSpan span) {
+    if (span is LinkTextSpan && span.toPlainText() == label) links.add(span);
+    if (span is TextSpan) span.children?.forEach(walk);
+  }
+
+  for (final rich in tester.widgetList<RichText>(_anyRichText())) {
+    walk(rich.text);
+  }
+  return links;
+}
+
+/// Taps the link labelled [label] where it is drawn.
+Future<void> _tapLink(WidgetTester tester, String label) =>
+    tester.tapOnText(find.textRange.ofSubstring(label));
+
 /// Extracts all plain text from all RichText widgets in the tree.
 String _allRichText(WidgetTester tester) {
   final richTexts = tester.widgetList<RichText>(_anyRichText());
@@ -531,7 +554,8 @@ void main() {
         ),
       );
 
-      await tester.tap(find.text('report.pdf'));
+      expect(_linkSpans(tester, 'report.pdf'), hasLength(1));
+      await _tapLink(tester, 'report.pdf');
       await tester.pump();
 
       expect(openedUrl, url);
@@ -766,8 +790,8 @@ void main() {
           _testable(const MessageContent(content: '[Open message]($url)')),
         );
 
-        expect(find.text('Open message'), findsOneWidget);
-        await tester.tap(find.text('Open message'));
+        expect(_linkSpans(tester, 'Open message'), hasLength(1));
+        await _tapLink(tester, 'Open message');
         await tester.pump();
 
         final container = ProviderScope.containerOf(
@@ -891,8 +915,8 @@ void main() {
           find.byKey(ValueKey('buzz-link-chip:$messageUrl')),
           findsOneWidget,
         );
-        expect(find.text(joinUrl), findsOneWidget);
-        expect(_allRichText(tester), contains('See \u{FFFC}. Then \u{FFFC}!'));
+        expect(_linkSpans(tester, joinUrl), hasLength(1));
+        expect(_allRichText(tester), contains('See \u{FFFC}. Then $joinUrl!'));
 
         await tester.tap(find.byKey(ValueKey('buzz-link-chip:$messageUrl')));
         await tester.pump();
@@ -909,7 +933,7 @@ void main() {
         );
 
         container.read(pendingDeepLinkProvider.notifier).consume();
-        await tester.tap(find.text(joinUrl));
+        await _tapLink(tester, joinUrl);
         await tester.pump();
         expect(
           container.read(pendingDeepLinkProvider),
@@ -957,8 +981,8 @@ void main() {
           _testable(const MessageContent(content: 'Join with $url')),
         );
 
-        expect(find.text(url), findsOneWidget);
-        await tester.tap(find.text(url));
+        expect(_linkSpans(tester, url), hasLength(1));
+        await _tapLink(tester, url);
         await tester.pump();
 
         final container = ProviderScope.containerOf(
@@ -1004,7 +1028,7 @@ void main() {
           _testable(const MessageContent(content: '[Open channel]($url)')),
         );
 
-        await tester.tap(find.text('Open channel'));
+        await _tapLink(tester, 'Open channel');
         await tester.pump();
 
         final container = ProviderScope.containerOf(
@@ -1034,7 +1058,7 @@ void main() {
           ),
         );
 
-        await tester.tap(find.text('Open channel'));
+        await _tapLink(tester, 'Open channel');
         await tester.pump();
 
         expect(tappedChannelId, channelId);
@@ -1093,12 +1117,10 @@ void main() {
         );
 
         // The URL text should be rendered and tappable.
-        expect(find.text('https://example.com'), findsOneWidget);
-        final linkText = tester.widget<Text>(find.text('https://example.com'));
-        expect(
-          linkText.style?.decoration ?? linkText.textSpan?.style?.decoration,
-          TextDecoration.underline,
-        );
+        final links = _linkSpans(tester, 'https://example.com');
+        expect(links, hasLength(1));
+        expect(links.single.onTap, isNotNull);
+        expect(links.single.style?.decoration, TextDecoration.underline);
       });
     });
 
@@ -1535,7 +1557,7 @@ void main() {
           find.byKey(const ValueKey('voice-note-attachment:$url')),
           findsNothing,
         );
-        expect(find.text('recording.mp4'), findsOneWidget);
+        expect(_linkSpans(tester, 'recording.mp4'), hasLength(1));
       });
 
       testWidgets('renders an audio imeta attachment as a voice note card', (
@@ -2721,8 +2743,12 @@ Photos
             find.byKey(ValueKey('buzz-link-chip:${entry.value}')),
             findsNothing,
           );
-          expect(find.text(entry.key), findsOneWidget);
+          expect(_allRichText(tester), contains(entry.key));
         }
+        // Mobile has no repo/PR destination, so that label stays inert text.
+        expect(_linkSpans(tester, 'Open message'), hasLength(1));
+        expect(_linkSpans(tester, 'Open channel'), hasLength(1));
+        expect(_linkSpans(tester, 'Release candidate'), isEmpty);
       });
 
       testWidgets('preserves formatting in authored Buzz labels', (
@@ -2820,6 +2846,44 @@ Photos
         expect(find.text('580ca78b · cdcdcdcd'), findsOneWidget);
         expect(find.text('580ca78b'), findsOneWidget);
       });
+    });
+
+    // A Buzz link chip's placeholder used to merge its whole paragraph into
+    // one semantics node, so every pill shared one label and one tap action.
+    testWidgets('gives each inline pill its own screen-reader stop', (
+      tester,
+    ) async {
+      final semantics = tester.ensureSemantics();
+      final prUrl = 'buzz://pr?id=${'cd' * 32}&owner=${'ab' * 32}&d=buzz';
+      String? tappedPubkey;
+      String? tappedChannel;
+      await tester.pumpWidget(
+        _testable(
+          MessageContent(
+            content: 'Ask @Alice in #general about $prUrl',
+            mentionNames: const {'pk1': 'Alice'},
+            channelNames: const {'general': 'channel-1'},
+            onMentionTap: (pubkey) => tappedPubkey = pubkey,
+            onChannelTap: (id) => tappedChannel = id,
+          ),
+        ),
+      );
+
+      final channel = find.semantics.byLabel('Open channel general');
+      expect(channel, findsOne);
+      tester.semantics.tap(channel);
+      expect(tappedChannel, 'channel-1');
+
+      final mention = find.semantics.byLabel('@\nAlice');
+      expect(mention, findsOne);
+      tester.semantics.tap(mention);
+      expect(tappedPubkey, 'pk1');
+
+      expect(
+        find.semantics.byLabel('Pull request cdcdcdcd in repository buzz'),
+        findsOne,
+      );
+      semantics.dispose();
     });
 
     group('@mentions', () {
@@ -3100,7 +3164,7 @@ Photos
         );
 
         expect(_findRich('#2959'), findsOneWidget);
-        expect(find.byIcon(LucideIcons.hash), findsNothing);
+        expect(find.byIcon(BuzzIcons.hash), findsNothing);
         expect(_hasNestedPlaceholder(tester), isFalse);
       });
 
@@ -3152,7 +3216,7 @@ Photos
 
         // Excluding the link-label scope must not disable the components
         // everywhere else: the bare tokens keep their pills.
-        expect(find.byIcon(LucideIcons.hash), findsOneWidget);
+        expect(find.byIcon(BuzzIcons.hash), findsOneWidget);
         expect(find.text('@'), findsOneWidget);
         expect(find.text('Alice'), findsOneWidget);
         expect(_findRich('#2959'), findsOneWidget);
