@@ -82,7 +82,7 @@ enum PersistResult {
     /// Event was already processed — return idempotent success.
     Duplicate,
     /// Event inserted — transaction is open, handler must commit after mutations.
-    Inserted(sqlx::Transaction<'static, sqlx::Postgres>),
+    Inserted(buzz_db::AdmittedTx),
 }
 
 /// Persist a command event inside a transaction. Returns the OPEN transaction
@@ -146,7 +146,6 @@ async fn persist_command_event(
         let result = db
             .replace_parameterized_event_in_transaction(
                 &mut tx,
-                tenant.community(),
                 event,
                 d_tag,
                 channel_id,
@@ -183,10 +182,9 @@ async fn persist_command_event(
         };
     }
 
-    let (_, was_inserted) =
-        buzz_db::event::insert_event_in_transaction(&mut tx, tenant.community(), event, channel_id)
-            .await
-            .map_err(|e| IngestError::Internal(format!("error: insert event: {e}")))?;
+    let (_, was_inserted) = buzz_db::event::insert_event_in_transaction(&mut tx, event, channel_id)
+        .await
+        .map_err(|e| IngestError::Internal(format!("error: insert event: {e}")))?;
     if was_inserted {
         Ok(PersistResult::Inserted(tx))
     } else {
@@ -811,6 +809,9 @@ async fn handle_workflow_def(
     })
 }
 
+/// Trigger rejection for a missing workflow and for one the sender does not own.
+const WORKFLOW_NOT_FOUND: &str = "invalid: workflow not found or not triggerable by you";
+
 async fn handle_workflow_trigger(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -837,15 +838,15 @@ async fn handle_workflow_trigger(
         .db
         .get_workflow(community_id, workflow_id)
         .await
-        .map_err(|_| IngestError::Rejected("invalid: workflow not found".into()))?;
+        .map_err(|_| IngestError::Rejected(WORKFLOW_NOT_FOUND.into()))?;
 
     // 3. Manual triggers execute with the workflow owner's authority, so only
     // the owner may start them. Channel membership alone is insufficient: a
     // member could otherwise invoke another user's webhook or message actions.
+    // Anyone else is told the workflow is not found, so the response never
+    // reveals whether a workflow ID exists.
     if workflow.owner_pubkey != self_bytes {
-        return Err(IngestError::Rejected(
-            "forbidden: not authorized to trigger this workflow".into(),
-        ));
+        return Err(IngestError::Rejected(WORKFLOW_NOT_FOUND.into()));
     }
 
     // SEC-006: manual triggers must honor the workflow's lifecycle state and
@@ -1603,7 +1604,6 @@ mod postgres_tests {
             .expect("begin legacy seed");
         let (_, was_inserted) = buzz_db::event::insert_event_in_transaction(
             &mut tx,
-            tenant.community(),
             &legacy,
             extract_channel_id(&legacy),
         )

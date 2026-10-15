@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use nostr::Event;
-use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder, Row, Transaction};
+use sqlx::{PgPool, QueryBuilder, Row};
 use uuid::Uuid;
 
 use buzz_core::kind::{
@@ -17,7 +17,7 @@ use buzz_core::{CommunityId, StoredEvent};
 use buzz_datastore_tracing::datastore_span;
 
 use crate::error::{DbError, Result};
-use crate::Db;
+use crate::{AdmittedTx, Db};
 
 // Compatibility exports preserve the pre-extraction public event-store paths.
 pub use crate::reminder::{
@@ -82,16 +82,22 @@ pub struct EventQuery {
     /// Restrict results to events with any of these IDs (multi-id `IN` pushdown).
     pub ids: Option<Vec<Vec<u8>>>,
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
-    /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
+    /// Matched positionally, with JSONB containment as the index prefilter.
     pub e_tags: Option<Vec<String>>,
     /// Restrict artifact rows ([`ARTIFACT_KINDS`]) to those with a `d` tag
-    /// matching any of these values, via JSONB containment. Their `d_tag`
+    /// matching any of these values, matched positionally. Their `d_tag`
     /// column is NULL (not NIP-33), so this lets identity lookups match before
     /// SQL `LIMIT`. Rows of other kinds are left to the caller's post-filter.
     pub d_tag_values: Option<Vec<String>>,
-    /// Restrict results to events with an exact custom tag pair.
-    /// Uses JSONB containment against `tags` before SQL `LIMIT`.
+    /// Restrict results to events with an exact custom tag pair: a tag whose
+    /// first element is the name and second the value, checked positionally
+    /// (JSONB containment is only the index prefilter) before SQL `LIMIT`.
     pub custom_tag: Option<(String, String)>,
+    /// Restrict results to events that, for every `(name, values)` entry,
+    /// have a tag whose name is `name` and whose first value is one of
+    /// `values` (NIP-01 tag matching), before SQL `LIMIT`. Entries with no
+    /// values are ignored.
+    pub tag_values: Vec<(String, Vec<String>)>,
     /// Restrict results to events in any of these channels. By default,
     /// channel-less global events are retained so this can enforce a viewer's
     /// accessible-channel scope without hiding global events. Set
@@ -112,17 +118,12 @@ pub struct EventQuery {
     /// private events are excluded from the candidate page rather than
     /// discarded after it.
     ///
-    /// The clause is: `AND (kind NOT IN (...) OR pubkey = $reader OR tags @> ?)`,
-    /// where the `IN` list is [`SHARED_GATED_KINDS`] and `?` is the JSONB
-    /// literal `[["shared","true"]]`.  The GIN index on `tags` (migration 0004,
-    /// jsonb_path_ops) makes the containment check fast.
-    ///
-    /// NOTE: `tags @> '[["shared","true"]]'` uses JSONB containment, which
-    /// matches any tag array that is a superset of `[["shared","true"]]` — it
-    /// would match `["shared","true","extra"]` too.  The ingest `parts.len() ==
-    /// 2` exact-shape check ensures such malformed tags are never stored, so the
-    /// SQL pushdown is sound.  Keeping `event_visible_to_reader` as post-filter
-    /// defense-in-depth catches any residual mismatch.
+    /// The clause is: `AND (kind NOT IN (...) OR pubkey = $reader OR <shared>)`,
+    /// where the `IN` list is [`SHARED_GATED_KINDS`] and `<shared>` requires a
+    /// tag whose element 0 is `shared` and element 1 is `true`. Containment on
+    /// the GIN index (migration 0004, jsonb_path_ops) is the fast first pass;
+    /// containment alone would also admit decoys like `["x","shared","true"]`.
+    /// `event_visible_to_reader` remains the post-filter.
     pub shared_gated_reader: Option<Vec<u8>>,
 }
 
@@ -152,6 +153,7 @@ impl EventQuery {
             e_tags: None,
             d_tag_values: None,
             custom_tag: None,
+            tag_values: Vec::new(),
             channel_ids: None,
             channel_ids_include_global: true,
             max_limit: None,
@@ -373,12 +375,12 @@ async fn huddle_started_link_exists_with_operation(
 /// A `false` return means the link was deleted or was never inserted, and the
 /// caller should abort the surrounding transaction.
 pub async fn huddle_started_link_exists_in_transaction(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
+    tx: &mut AdmittedTx,
     parent_channel_id: Uuid,
     ephemeral_channel_id: Uuid,
     creator_pubkey: &[u8],
 ) -> Result<bool> {
+    let community_id = tx.community();
     let uuid_needle = format!("%{}%", ephemeral_channel_id);
     let candidates: Vec<String> = sqlx::query_scalar(
         r#"
@@ -403,7 +405,7 @@ pub async fn huddle_started_link_exists_in_transaction(
     .bind(HUDDLE_LINK_CONTENT_MAX_BYTES)
     .bind(uuid_needle)
     .bind(HUDDLE_LINK_CANDIDATE_LIMIT)
-    .fetch_all(tx.as_mut())
+    .fetch_all(tx.conn())
     .await?;
 
     Ok(candidates
@@ -412,6 +414,9 @@ pub async fn huddle_started_link_exists_in_transaction(
 }
 
 /// Insert a Nostr event. Rejects AUTH and ephemeral kinds.
+///
+/// This raw-pool helper does not start application push production. Serving
+/// callers should use [`Db::insert_event`] with a configured [`Db`].
 ///
 /// Returns `(StoredEvent, was_inserted)` — `was_inserted` is `false` on duplicate.
 pub async fn insert_event(
@@ -426,35 +431,35 @@ pub async fn insert_event(
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    let result = insert_event_in_transaction(&mut tx, community_id, event, channel_id).await?;
+    let result = insert_event_in_transaction(&mut tx, event, channel_id).await?;
     tx.commit().await?;
     Ok(result)
 }
 
-/// Insert a Nostr event in a caller-owned PostgreSQL transaction.
+/// Insert a Nostr event in a caller-owned admitted transaction, scoped to the
+/// transaction's community.
 ///
 /// This is the transaction-composition seam for callers that must keep the
 /// event insert open while performing related work. The caller owns commit or
 /// rollback.
 pub async fn insert_event_in_transaction(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
+    tx: &mut AdmittedTx,
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<(StoredEvent, bool)> {
-    let result = insert_event_on(tx.as_mut(), community_id, event, channel_id).await?;
+    let result = insert_event_on(tx, event, channel_id).await?;
     if result.1 {
-        crate::operator_listener::enqueue_mentions_in_transaction(tx, community_id, event).await?;
+        crate::operator_listener::enqueue_mentions_in_transaction(tx, event).await?;
     }
     Ok(result)
 }
 
 async fn insert_event_on(
-    connection: &mut PgConnection,
-    community_id: CommunityId,
+    tx: &mut AdmittedTx,
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<(StoredEvent, bool)> {
+    let community_id = tx.community();
     let kind_u16 = event.kind.as_u16();
     let kind_u32 = u32::from(kind_u16);
 
@@ -496,10 +501,19 @@ async fn insert_event_on(
     .bind(channel_id)
     .bind(d_tag.as_deref())
     .bind(not_before)
-    .execute(connection)
+    .execute(tx.conn())
     .await?;
 
     let was_inserted = result.rows_affected() > 0;
+    if was_inserted {
+        crate::store::event_follow_up::after_admitted_insert(
+            tx,
+            id_bytes.as_slice(),
+            kind_i32,
+            channel_id,
+        )
+        .await?;
+    }
 
     Ok((
         StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
@@ -568,7 +582,10 @@ pub(crate) async fn query_events_on(
     let rows = if q.e_tags.is_some() {
         fetch_with_e_tag_deadline(conn, &mut qb).await?
     } else {
-        qb.build().fetch_all(&mut *conn).await?
+        qb.build()
+            .persistent(!has_tag_values(q))
+            .fetch_all(&mut *conn)
+            .await?
     };
 
     let mut out = Vec::with_capacity(rows.len());
@@ -708,14 +725,15 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
         }
     }
 
-    // e-tag pushdown via JSONB containment: tags @> '[["e","<hex>"]]'.
-    // Multiple e-tags use OR (any match). Served by idx_events_tags_gin
+    // e-tag pushdown: exact positional match with a JSONB containment
+    // prefilter, tags @> ANY('[["e","<hex>"]]', ...). Served by idx_events_tags_gin
     // (GIN, jsonb_path_ops — migrations/0004): the channel-window aux closure
     // fans this out once per retained row, which made unindexed containment
     // the dominant scroll-back cost (~1.7s/page on staging).
     if let Some(ref e_tags) = q.e_tags {
         if !e_tags.is_empty() {
-            push_e_tag_filter(&mut qb, col_prefix, e_tags);
+            qb.push(" AND ");
+            push_exact_tag_match(&mut qb, col_prefix, "e", e_tags);
         }
     }
 
@@ -724,10 +742,11 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
     }
 
     if let Some((ref name, ref value)) = q.custom_tag {
-        let containment = serde_json::json!([[name, value]]);
-        qb.push(format!(" AND {col_prefix}tags @> "))
-            .push_bind(containment);
+        qb.push(" AND ");
+        push_exact_tag_match(&mut qb, col_prefix, name, std::slice::from_ref(value));
     }
+
+    push_tag_value_filters(&mut qb, col_prefix, &q.tag_values);
 
     if let Some(s) = q.since {
         qb.push(format!(" AND {col_prefix}created_at >= "))
@@ -771,16 +790,12 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
     // shared ones off the end of the result set (the catalog query pattern).
     //
     // Clause: AND (kind NOT IN (30175, 30178) OR pubkey = $reader
-    //              OR tags @> '[["shared","true"]]')
+    //              OR <exact ["shared","true",...] tag>)
     //
-    // The JSONB containment check is served by idx_events_tags_gin (migration
-    // 0004, jsonb_path_ops).  `tags @> '[["shared","true"]]'` matches any array
-    // that contains exactly the sub-array — a two-element `["shared","true"]`
-    // tag passes; a tag-absent event does not.  Because ingest requires exactly
-    // two elements for the shared tag (parts.len() == 2), no stored event can
-    // carry a three-element superset.
+    // The shared match is positional, like the other tag pushdowns: plain
+    // containment would admit a private event carrying ["x","shared","true"],
+    // which then wastes a page slot before the post-filter drops it.
     if let Some(ref reader_bytes) = q.shared_gated_reader {
-        let shared_containment = serde_json::json!([["shared", "true"]]);
         qb.push(format!(" AND ({col_prefix}kind NOT IN ("));
         let mut sep = qb.separated(", ");
         for kind in SHARED_GATED_KINDS {
@@ -788,8 +803,8 @@ fn build_query_events_sql(q: &EventQuery) -> QueryBuilder<sqlx::Postgres> {
         }
         qb.push(format!(") OR {col_prefix}pubkey = "));
         qb.push_bind(reader_bytes.clone());
-        qb.push(format!(" OR {col_prefix}tags @> "));
-        qb.push_bind(shared_containment);
+        qb.push(" OR ");
+        push_exact_tag_match(&mut qb, col_prefix, "shared", &["true".to_owned()]);
         qb.push(")");
     }
 
@@ -840,21 +855,63 @@ async fn fetch_with_e_tag_deadline(
     Ok(rows)
 }
 
-/// e-tag pushdown as one array-bound containment test instead of an N-way
-/// `OR` chain, so planner cost does not scale with the number of referenced
-/// ids (the thread aux hop sends one id per reply).
-fn push_e_tag_filter(qb: &mut QueryBuilder<sqlx::Postgres>, col_prefix: &str, e_tags: &[String]) {
-    let containments: Vec<serde_json::Value> = e_tags
+/// Match a tag whose first element is `name` and whose second is any of
+/// `values` (NIP-01), as one parenthesized predicate.
+///
+/// JSONB containment alone ignores element position and multiplicity:
+/// `[["t","t"]]` is contained in `["t","other"]`, and `[["e",id]]` in
+/// `["x","e",id]`. Over-matching before `LIMIT` lets a non-matching newer row
+/// take the slot, so containment stays only as the GIN-indexed prefilter
+/// (one array-bound test, so planner cost does not scale with `values`) and
+/// the positional check makes the predicate exact.
+fn push_exact_tag_match(
+    qb: &mut QueryBuilder<sqlx::Postgres>,
+    col_prefix: &str,
+    name: &str,
+    values: &[String],
+) {
+    let containments: Vec<serde_json::Value> = values
         .iter()
-        .map(|hex_id| serde_json::json!([["e", hex_id]]))
+        .map(|value| serde_json::json!([[name, value]]))
         .collect();
-    qb.push(format!(" AND {col_prefix}tags @> ANY("))
+    qb.push(format!("({col_prefix}tags @> ANY("))
         .push_bind(containments)
-        .push("::jsonb[])");
+        .push(format!(
+            "::jsonb[]) AND EXISTS (SELECT 1 FROM jsonb_array_elements({col_prefix}tags) AS tag \
+             WHERE tag->>0 = "
+        ))
+        .push_bind(name.to_owned())
+        .push(" AND tag->>1 = ANY(")
+        .push_bind(values.to_vec())
+        .push(")))");
+}
+
+/// Whether `q` carries a [`EventQuery::tag_values`] match. Such a query runs
+/// as an unnamed statement, so Postgres plans it with the bound values. After
+/// a few runs, a cached generic plan ignores the value and can scan every
+/// group-state row in the community instead of using the `tags` GIN index.
+fn has_tag_values(q: &EventQuery) -> bool {
+    q.tag_values.iter().any(|(_, values)| !values.is_empty())
+}
+
+/// AND one [`push_exact_tag_match`] per non-empty [`EventQuery::tag_values`]
+/// entry, so entries are ANDed and values within an entry are ORed.
+fn push_tag_value_filters(
+    qb: &mut QueryBuilder<sqlx::Postgres>,
+    col_prefix: &str,
+    tag_values: &[(String, Vec<String>)],
+) {
+    for (name, values) in tag_values {
+        if values.is_empty() {
+            continue;
+        }
+        qb.push(" AND ");
+        push_exact_tag_match(qb, col_prefix, name, values);
+    }
 }
 
 /// Match `#d` on artifact rows before `LIMIT` while leaving other kinds to the
-/// caller's post-filter: `(kind NOT IN (artifact kinds) OR tags @> [["d", v]] ...)`.
+/// caller's post-filter: `(kind NOT IN (artifact kinds) OR <exact d match>)`.
 fn push_artifact_d_tag_predicate(
     qb: &mut QueryBuilder<sqlx::Postgres>,
     col_prefix: &str,
@@ -865,12 +922,9 @@ fn push_artifact_d_tag_predicate(
     }
     let [revision, removal] = ARTIFACT_KINDS;
     qb.push(format!(
-        " AND ({col_prefix}kind NOT IN ({revision}, {removal})"
+        " AND ({col_prefix}kind NOT IN ({revision}, {removal}) OR "
     ));
-    for value in values {
-        qb.push(format!(" OR {col_prefix}tags @> "));
-        qb.push_bind(serde_json::json!([["d", value]]));
-    }
+    push_exact_tag_match(qb, col_prefix, "d", values);
     qb.push(")");
 }
 
@@ -1043,13 +1097,21 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
 
     if let Some(ref e_tags) = q.e_tags {
         if !e_tags.is_empty() {
-            push_e_tag_filter(&mut qb, col_prefix, e_tags);
+            qb.push(" AND ");
+            push_exact_tag_match(&mut qb, col_prefix, "e", e_tags);
         }
     }
 
     if let Some(ref values) = q.d_tag_values {
         push_artifact_d_tag_predicate(&mut qb, col_prefix, values);
     }
+
+    if let Some((ref name, ref value)) = q.custom_tag {
+        qb.push(" AND ");
+        push_exact_tag_match(&mut qb, col_prefix, name, std::slice::from_ref(value));
+    }
+
+    push_tag_value_filters(&mut qb, col_prefix, &q.tag_values);
 
     if let Some(s) = q.since {
         qb.push(format!(" AND {col_prefix}created_at >= "))
@@ -1082,7 +1144,10 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
             .next()
             .ok_or_else(|| DbError::InvalidData("COUNT returned no rows".to_string()))?
     } else {
-        qb.build().fetch_one(&mut *conn).await?
+        qb.build()
+            .persistent(!has_tag_values(q))
+            .fetch_one(&mut *conn)
+            .await?
     };
     let cnt: i64 = row.try_get("cnt")?;
 
@@ -1168,7 +1233,6 @@ pub async fn soft_delete_by_coordinate(
     let purged = if may_be_retention_free(kind) {
         purge_retention_free_events(
             &mut tx,
-            community_id,
             RetentionFreeTarget::Coordinate {
                 kind,
                 pubkey,
@@ -1198,7 +1262,7 @@ pub async fn soft_delete_by_coordinate(
     .bind(pubkey)
     .bind(d_tag)
     .bind(deletion_created_at)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     tx.commit().await?;
@@ -1244,15 +1308,15 @@ enum RetentionFreeTarget<'a> {
 /// purged here or left live, never soft-deleted. Returns the number of events
 /// removed.
 async fn purge_retention_free_events(
-    tx: &mut PgConnection,
-    community_id: CommunityId,
+    tx: &mut AdmittedTx,
     target: RetentionFreeTarget<'_>,
 ) -> Result<u64> {
+    let community_id = tx.community();
     // Migration 0011 fences NIP-RS hard deletes behind a transaction-local
     // opt-in. The fence and this opt-in are removed together once the
     // migration-only triggers are dropped.
     sqlx::query("SELECT set_config('buzz.nip_rs_hard_delete', 'on', true)")
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
     let purged: i64 = match target {
@@ -1260,7 +1324,7 @@ async fn purge_retention_free_events(
             sqlx::query_scalar(purge_retention_free_sql!("id = $2"))
                 .bind(community_id.as_uuid())
                 .bind(event_id)
-                .fetch_one(&mut *tx)
+                .fetch_one(tx.conn())
                 .await?
         }
         RetentionFreeTarget::Coordinate {
@@ -1277,7 +1341,7 @@ async fn purge_retention_free_events(
             .bind(pubkey)
             .bind(d_tag)
             .bind(created_at_or_before)
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await?
         }
     };
@@ -1313,7 +1377,6 @@ pub async fn soft_delete_event_and_update_thread(
     .await?;
     let deleted = soft_delete_event_and_update_thread_in_tx(
         &mut tx,
-        community_id,
         event_id,
         parent_event_id,
         root_event_id,
@@ -1328,12 +1391,12 @@ pub async fn soft_delete_event_and_update_thread(
 /// Callers that must fence the delete with their own writes (e.g. the admin
 /// action lease/marker) run this inside their transaction; the caller commits.
 pub(crate) async fn soft_delete_event_and_update_thread_in_tx(
-    tx: &mut PgConnection,
-    community_id: CommunityId,
+    tx: &mut AdmittedTx,
     event_id: &[u8],
     parent_event_id: Option<&[u8]>,
     root_event_id: Option<&[u8]>,
 ) -> Result<bool> {
+    let community_id = tx.community();
     use crate::store::replaceable::event_replacement_lock_key;
 
     // Derive the target event's kind and channel_id inside the transaction so
@@ -1344,7 +1407,7 @@ pub(crate) async fn soft_delete_event_and_update_thread_in_tx(
     )
     .bind(community_id.as_uuid())
     .bind(event_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx.conn())
     .await?;
 
     // Relay-signed move removals are the source channel's only replay record.
@@ -1364,14 +1427,13 @@ pub(crate) async fn soft_delete_event_and_update_thread_in_tx(
             );
             sqlx::query("SELECT pg_advisory_xact_lock($1)")
                 .bind(lock_key)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
         }
     }
 
     let purged = if target.is_some_and(|(kind, _)| may_be_retention_free(kind)) {
-        purge_retention_free_events(&mut *tx, community_id, RetentionFreeTarget::Id(event_id))
-            .await?
+        purge_retention_free_events(tx, RetentionFreeTarget::Id(event_id)).await?
     } else {
         0
     };
@@ -1383,7 +1445,7 @@ pub(crate) async fn soft_delete_event_and_update_thread_in_tx(
     ))
     .bind(community_id.as_uuid())
     .bind(event_id)
-    .execute(&mut *tx)
+    .execute(tx.conn())
     .await?;
 
     let deleted = purged > 0 || result.rows_affected() > 0;
@@ -1397,7 +1459,7 @@ pub(crate) async fn soft_delete_event_and_update_thread_in_tx(
             )
             .bind(community_id.as_uuid())
             .bind(pid)
-            .execute(&mut *tx)
+            .execute(tx.conn())
             .await?;
 
             if let Some(root_id) = root_event_id {
@@ -1408,7 +1470,7 @@ pub(crate) async fn soft_delete_event_and_update_thread_in_tx(
                 )
                 .bind(community_id.as_uuid())
                 .bind(root_id)
-                .execute(&mut *tx)
+                .execute(tx.conn())
                 .await?;
             }
         }
@@ -1694,12 +1756,12 @@ pub struct ThreadMetadataParams<'a> {
 }
 
 pub(crate) async fn insert_event_with_thread_metadata_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
+    tx: &mut AdmittedTx,
     event: &Event,
     channel_id: Option<Uuid>,
     thread_meta: Option<ThreadMetadataParams<'_>>,
 ) -> Result<(StoredEvent, bool)> {
+    let community_id = tx.community();
     let kind_u16 = event.kind.as_u16();
     let kind_u32 = u32::from(kind_u16);
 
@@ -1741,12 +1803,20 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
     .bind(channel_id)
     .bind(d_tag.as_deref())
     .bind(not_before)
-    .execute(&mut **tx)
+    .execute(tx.conn())
     .await?;
 
     let was_inserted = result.rows_affected() > 0;
 
     if was_inserted {
+        crate::store::event_follow_up::after_admitted_insert(
+            tx,
+            id_bytes.as_slice(),
+            kind_i32,
+            channel_id,
+        )
+        .await?;
+
         if let Some(ref meta) = thread_meta {
             let broadcast_val: bool = meta.broadcast;
 
@@ -1771,7 +1841,7 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
             .bind(meta.root_event_created_at)
             .bind(meta.depth)
             .bind(broadcast_val)
-            .execute(&mut **tx)
+            .execute(tx.conn())
             .await?;
 
             // Only bump reply counts if the metadata row was actually inserted.
@@ -1798,7 +1868,7 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
                     .bind(parent_ts)
                     .bind(pid)
                     .bind(meta.channel_id)
-                    .execute(&mut **tx)
+                    .execute(tx.conn())
                     .await?;
 
                     // Ensure the root also has a row (may differ from parent for nested replies).
@@ -1821,7 +1891,7 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
                             .bind(root_ts)
                             .bind(root_id)
                             .bind(meta.channel_id)
-                            .execute(&mut **tx)
+                            .execute(tx.conn())
                             .await?;
                         }
                     }
@@ -1835,7 +1905,7 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
                     )
                     .bind(community_id.as_uuid())
                     .bind(pid)
-                    .execute(&mut **tx)
+                    .execute(tx.conn())
                     .await?;
 
                     if let Some(root_id) = meta.root_event_id {
@@ -1848,14 +1918,14 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
                         )
                         .bind(community_id.as_uuid())
                         .bind(root_id)
-                        .execute(&mut **tx)
+                        .execute(tx.conn())
                         .await?;
                     }
                 }
             }
         }
 
-        crate::operator_listener::enqueue_mentions_in_transaction(tx, community_id, event).await?;
+        crate::operator_listener::enqueue_mentions_in_transaction(tx, event).await?;
     }
 
     Ok((
@@ -1865,8 +1935,7 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
 }
 
 pub(crate) async fn acquire_canvas_event_write_lock_if_needed(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
+    tx: &mut AdmittedTx,
     event: &Event,
     channel_id: Option<Uuid>,
 ) -> Result<()> {
@@ -1878,16 +1947,13 @@ pub(crate) async fn acquire_canvas_event_write_lock_if_needed(
         return Ok(());
     };
 
-    acquire_canvas_coordinate_lock(tx, community_id, channel_id).await
+    acquire_canvas_coordinate_lock(tx, channel_id).await
 }
 
 /// Take the per-`(community, canvas kind, channel)` advisory lock that
 /// serializes canvas writes on one channel head, author excluded.
-async fn acquire_canvas_coordinate_lock(
-    tx: &mut Transaction<'_, Postgres>,
-    community_id: CommunityId,
-    channel_id: Uuid,
-) -> Result<()> {
+async fn acquire_canvas_coordinate_lock(tx: &mut AdmittedTx, channel_id: Uuid) -> Result<()> {
+    let community_id = tx.community();
     use crate::store::replaceable::event_replacement_lock_key;
 
     let lock_key = event_replacement_lock_key(
@@ -1898,7 +1964,7 @@ async fn acquire_canvas_coordinate_lock(
     );
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(lock_key)
-        .execute(&mut **tx)
+        .execute(tx.conn())
         .await?;
     Ok(())
 }
@@ -1930,10 +1996,9 @@ pub async fn insert_event_with_thread_metadata(
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    acquire_canvas_event_write_lock_if_needed(&mut tx, community_id, event, channel_id).await?;
+    acquire_canvas_event_write_lock_if_needed(&mut tx, event, channel_id).await?;
     let result =
-        insert_event_with_thread_metadata_tx(&mut tx, community_id, event, channel_id, thread_meta)
-            .await?;
+        insert_event_with_thread_metadata_tx(&mut tx, event, channel_id, thread_meta).await?;
     tx.commit().await?;
     Ok(result)
 }
@@ -2021,7 +2086,7 @@ pub async fn insert_canvas_head_checked(
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
-    acquire_canvas_coordinate_lock(&mut tx, community_id, channel_id).await?;
+    acquire_canvas_coordinate_lock(&mut tx, channel_id).await?;
 
     let head: Option<(Vec<u8>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT id, created_at FROM events \
@@ -2031,7 +2096,7 @@ pub async fn insert_canvas_head_checked(
     .bind(community_id.as_uuid())
     .bind(kind_i32)
     .bind(channel_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx.conn())
     .await?;
 
     // Idempotent replay: the incoming event is already the live head.
@@ -2073,8 +2138,7 @@ pub async fn insert_canvas_head_checked(
     }
 
     let (stored, was_inserted) =
-        insert_event_with_thread_metadata_tx(&mut tx, community_id, event, Some(channel_id), None)
-            .await?;
+        insert_event_with_thread_metadata_tx(&mut tx, event, Some(channel_id), None).await?;
     if !was_inserted {
         // The primary-key row already exists. The idempotent-replay branch above
         // already returned `Duplicate` for the case where the incoming event is
@@ -2087,7 +2151,7 @@ pub async fn insert_canvas_head_checked(
         tx.rollback().await?;
         return Ok((stored, ChannelHeadWriteStatus::RevisionMismatch));
     }
-    crate::insert_mentions_in_transaction(&mut tx, community_id, event, Some(channel_id)).await?;
+    crate::insert_mentions_in_transaction(&mut tx, event, Some(channel_id)).await?;
     tx.commit().await?;
 
     Ok((stored, ChannelHeadWriteStatus::Inserted))
@@ -2108,11 +2172,10 @@ impl Db {
             crate::observability::WriterOperation::EventWrite,
         )
         .await?;
-        let result =
-            crate::event::insert_event_in_transaction(&mut tx, community_id, event, channel_id)
-                .await?;
+        tx.set_push_enqueue(self.push_enqueue.clone());
+        let result = crate::event::insert_event_in_transaction(&mut tx, event, channel_id).await?;
         if result.1 {
-            crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
+            crate::insert_mentions_in_transaction(&mut tx, event, channel_id).await?;
         }
         tx.commit().await?;
         Ok(result)
@@ -2635,23 +2698,17 @@ impl Db {
             crate::observability::WriterOperation::EventWrite,
         )
         .await?;
-        crate::event::acquire_canvas_event_write_lock_if_needed(
-            &mut tx,
-            community_id,
-            event,
-            channel_id,
-        )
-        .await?;
+        tx.set_push_enqueue(self.push_enqueue.clone());
+        crate::event::acquire_canvas_event_write_lock_if_needed(&mut tx, event, channel_id).await?;
         let result = crate::event::insert_event_with_thread_metadata_tx(
             &mut tx,
-            community_id,
             event,
             channel_id,
             thread_meta,
         )
         .await?;
         if result.1 {
-            crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
+            crate::insert_mentions_in_transaction(&mut tx, event, channel_id).await?;
         }
         tx.commit().await?;
         Ok(result)
@@ -2704,7 +2761,7 @@ impl Db {
         .bind(community_id.as_uuid())
         .bind(channel_id)
         .bind(relay_pubkey)
-        .execute(&mut *tx)
+        .execute(tx.conn())
         .await?;
 
         tx.commit().await?;
@@ -2818,6 +2875,44 @@ mod postgres_tests {
         id
     }
 
+    /// Statements on `conn` that Postgres holds as prepared, matching `like`.
+    async fn prepared_like(conn: &mut sqlx::PgConnection, like: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM pg_prepared_statements WHERE statement LIKE $1")
+            .bind(like)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("read prepared statements")
+    }
+
+    /// A label or creator match must keep parameter-aware planning. A cached
+    /// generic plan ignores the label value and scans every group-state row in
+    /// the community instead of using the `tags` GIN index.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn tag_value_queries_are_not_cached_as_prepared_statements() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let mut conn = pool.acquire().await.expect("acquire");
+        sqlx::query("DEALLOCATE ALL")
+            .execute(&mut *conn)
+            .await
+            .expect("clear prepared statements");
+        let mut q = EventQuery::for_community(community);
+        q.kinds = Some(vec![39000]);
+        q.tag_values = vec![("t".to_owned(), vec!["for-you".to_owned()])];
+        for _ in 0..6 {
+            query_events_on(&mut conn, &q).await.expect("label query");
+            count_events_on(&mut conn, &q).await.expect("label count");
+        }
+        assert_eq!(prepared_like(&mut conn, "%tags @> ANY(%").await, 0);
+
+        // Control: the same query without a tag match stays a cached statement,
+        // so the check above can see one.
+        q.tag_values.clear();
+        query_events_on(&mut conn, &q).await.expect("plain query");
+        assert!(prepared_like(&mut conn, "%FROM events%").await > 0);
+    }
+
     /// Effective `statement_timeout` observed *inside* the e-tag deadline, and
     /// the value restored on `conn` afterwards.
     async fn deadline_inside_and_after(conn: &mut sqlx::PgConnection) -> (String, String) {
@@ -2831,6 +2926,145 @@ mod postgres_tests {
             .await
             .expect("show timeout");
         (inside, after)
+    }
+
+    /// Every pushed-down tag filter matches by position: a newer decoy whose
+    /// tag holds the wanted name and value in the wrong slots must not take a
+    /// `limit: 1` page or be counted.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn pushed_down_tag_filters_reject_positional_decoys() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let keys = Keys::generate();
+        let now = nostr::Timestamp::now().as_secs();
+        let target = "ab".repeat(32);
+        let insert = |kind: u16, tag: Vec<&str>, at: u64| {
+            let event = EventBuilder::new(Kind::Custom(kind), "")
+                .tags([Tag::parse(tag).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(at))
+                .sign_with_keys(&keys)
+                .unwrap();
+            let pool = pool.clone();
+            async move {
+                insert_event(&pool, community, &event, None).await.unwrap();
+                event.id.as_bytes().to_vec()
+            }
+        };
+        // Removals: revisions also need an `artifact_heads` row to be read.
+        let [_, artifact_kind] = ARTIFACT_KINDS;
+        let artifact_kind = artifact_kind as u16;
+
+        struct Case<'a> {
+            label: &'a str,
+            kind: u16,
+            real: Vec<&'a str>,
+            /// Inserted after `real`, so it wins a `limit: 1` read if matched.
+            decoy: Vec<&'a str>,
+            query: EventQuery,
+        }
+        let cases = [
+            Case {
+                label: "custom tag value in name slot",
+                kind: 1,
+                real: vec!["t", "t"],
+                decoy: vec!["t", "other"],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.custom_tag = Some(("t".into(), "t".into()));
+                    q
+                },
+            },
+            Case {
+                label: "custom tag shifted right",
+                kind: 1,
+                real: vec!["t", "v"],
+                decoy: vec!["meta", "t", "v"],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.custom_tag = Some(("t".into(), "v".into()));
+                    q
+                },
+            },
+            Case {
+                label: "e tag shifted right",
+                kind: 7,
+                real: vec!["e", &target],
+                decoy: vec!["x", "e", &target],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.e_tags = Some(vec![target.clone()]);
+                    q
+                },
+            },
+            Case {
+                label: "artifact d tag shifted right",
+                kind: artifact_kind,
+                real: vec!["d", "a1"],
+                decoy: vec!["x", "d", "a1"],
+                query: {
+                    let mut q = EventQuery::for_community(community);
+                    q.d_tag_values = Some(vec!["a1".into()]);
+                    q
+                },
+            },
+        ];
+        for (offset, case) in (0u64..).step_by(10).zip(cases) {
+            let Case {
+                label,
+                kind,
+                real,
+                decoy,
+                query: mut q,
+            } = case;
+            let real_id = insert(kind, real, now - 1000 + offset).await;
+            insert(kind, decoy, now - 995 + offset).await;
+            q.kinds = Some(vec![i32::from(kind)]);
+            q.pubkey = Some(keys.public_key().to_bytes().to_vec());
+            q.since = Some(DateTime::from_timestamp((now - 1000 + offset) as i64, 0).unwrap());
+            q.until = Some(DateTime::from_timestamp((now - 995 + offset) as i64, 0).unwrap());
+            q.limit = Some(1);
+            let rows = query_events(&pool, &q).await.unwrap();
+            assert_eq!(rows.len(), 1, "{label}");
+            assert_eq!(rows[0].event.id.as_bytes().to_vec(), real_id, "{label}");
+            assert_eq!(count_events(&pool, &q).await.unwrap(), 1, "{label} count");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn shared_gate_rejects_positional_decoy() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let (author, reader) = (Keys::generate(), Keys::generate());
+        let kind = SHARED_GATED_KINDS[0];
+        let now = nostr::Timestamp::now().as_secs();
+        let mut ids = Vec::new();
+        // Real shared event, then a newer private one whose shared marker is
+        // shifted right, so it would win a `limit: 1` read if admitted.
+        for (tag, at) in [
+            (["shared", "true"].as_slice(), now - 10),
+            (&["x", "shared", "true"], now),
+        ] {
+            let event = EventBuilder::new(Kind::Custom(kind as u16), "")
+                .tags([
+                    Tag::parse(["d", &Uuid::new_v4().to_string()]).unwrap(),
+                    Tag::parse(tag.iter().copied()).unwrap(),
+                ])
+                .custom_created_at(nostr::Timestamp::from(at))
+                .sign_with_keys(&author)
+                .unwrap();
+            insert_event(&pool, community, &event, None).await.unwrap();
+            ids.push(event.id.as_bytes().to_vec());
+        }
+        let mut q = EventQuery::for_community(community);
+        q.kinds = Some(vec![kind as i32]);
+        q.pubkey = Some(author.public_key().to_bytes().to_vec());
+        q.shared_gated_reader = Some(reader.public_key().to_bytes().to_vec());
+        q.limit = Some(1);
+        let rows = query_events(&pool, &q).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event.id.as_bytes().to_vec(), ids[0]);
     }
 
     #[tokio::test]
@@ -3000,8 +3234,14 @@ mod postgres_tests {
         let community = CommunityId::from_uuid(community_uuid);
         let event = make_text_event("caller-owned transaction");
 
-        let mut tx = pool.begin().await.expect("begin event insert transaction");
-        let (_, was_inserted) = insert_event_in_transaction(&mut tx, community, &event, None)
+        let mut tx = crate::begin_community_event_write_transaction(
+            &pool,
+            community,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await
+        .expect("begin event insert transaction");
+        let (_, was_inserted) = insert_event_in_transaction(&mut tx, &event, None)
             .await
             .expect("insert event in caller transaction");
         assert!(was_inserted);
@@ -3795,16 +4035,16 @@ mod postgres_tests {
         });
 
         // Open the join transaction and acquire FOR SHARE.
-        let mut tx = pool.begin().await.expect("begin join tx");
-        let exists = huddle_started_link_exists_in_transaction(
-            &mut tx,
+        let mut tx = crate::begin_community_event_write_transaction(
+            &pool,
             community_id,
-            parent,
-            session,
-            &creator,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await
-        .expect("huddle_started_link_exists_in_transaction");
+        .expect("begin join tx");
+        let exists = huddle_started_link_exists_in_transaction(&mut tx, parent, session, &creator)
+            .await
+            .expect("huddle_started_link_exists_in_transaction");
         assert!(exists, "I4: link must exist before commit");
 
         // Signal the deleter to attempt its UPDATE now.

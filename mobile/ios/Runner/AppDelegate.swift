@@ -41,6 +41,7 @@ import os.log
   private var concentricSheetSurfaceChannel: FlutterMethodChannel?
   private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
   private var nativeEmojiPickerCoordinator: NativeEmojiPickerCoordinator?
+  private var nativeAddMembersSheetCoordinator: NativeAddMembersSheetCoordinator?
   private var nativeConfirmationDialogCoordinator: NativeConfirmationDialogCoordinator?
   private var nativeProfileTextEditorCoordinator: NativeProfileTextEditorCoordinator?
   private var nativeMessageActionSurfaceSupportChannel: FlutterMethodChannel?
@@ -242,6 +243,17 @@ import os.log
     nativeEmojiPickerCoordinator = NativeEmojiPickerCoordinator(
       messenger: messenger,
       parentViewController: nativeEmojiPickerRegistrar?.viewController
+    )
+
+    engineBridge.pluginRegistry.registrar(forPlugin: "BuzzNativePresenceMenu")?.register(
+      NativePresenceMenuFactory(messenger: messenger), withId: "buzz/presence_menu"
+    )
+
+    nativeAddMembersSheetCoordinator = NativeAddMembersSheetCoordinator(
+      messenger: messenger,
+      parentViewController: engineBridge.pluginRegistry.registrar(
+        forPlugin: "BuzzNativeAddMembersSheet"
+      )?.viewController
     )
 
     nativeConfirmationDialogCoordinator = NativeConfirmationDialogCoordinator(
@@ -1061,11 +1073,13 @@ import os.log
 }
 
 extension BuzzPushNavigationTarget {
-  fileprivate var flutterArguments: [String: String] {
-    [
+  var flutterArguments: [String: String] {
+    var arguments = [
       "eventId": eventID,
       "communityId": communityID,
       "channelId": channelID,
     ]
+    arguments["threadRootId"] = threadRootID
+    return arguments
   }
 }

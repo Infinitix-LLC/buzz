@@ -87,10 +87,10 @@ run_unit_tests() {
   run_test_step "buzz-auth unit tests" \
     cargo test -p buzz-auth --lib -- --nocapture
 
-  # S4 cross-pod NIP-FI disconnect payload tests (infra-free). Mirrors
-  # `just test-unit`.
-  run_test_step "buzz-pubsub conn_control NIP-FI tests" \
-    cargo test -p buzz-pubsub --lib conn_control::tests::nip_fi_disconnect_ -- --nocapture
+  # Cross-pod disconnect payload tests (NIP-FI and community archive fence;
+  # infra-free). Mirrors `just test-unit`.
+  run_test_step "buzz-pubsub conn_control tests" \
+    cargo test -p buzz-pubsub --lib conn_control::tests:: -- --nocapture
 
   run_test_step "buzz-voice tests" \
     cargo test -p buzz-voice --lib -- --nocapture
@@ -132,6 +132,12 @@ run_unit_tests() {
   run_test_step "buzz-admin storage snapshot tests" \
     cargo test -p buzz-admin storage_snapshot -- --nocapture
 
+  run_test_step "buzz-admin community archive command tests" \
+    cargo test -p buzz-admin communities -- --nocapture
+
+  run_test_step "buzz-admin partition audit outcome contract test" \
+    cargo test -p buzz-admin tests::partition_audit_outcomes_keep_their_json_names_and_exit_codes -- --exact --nocapture
+
   # Multi-tenant conformance gate: independent replay checker + golden
   # fixtures (buzz-conformance). Pure in-process trace replay, no infra.
   run_test_step "buzz-conformance tests" \
@@ -169,6 +175,12 @@ run_unit_tests() {
   # Mirror the relay filters from `just test-unit`: the three handler modules,
   # storage-snapshot helpers, readiness and router unit suites, and the single
   # scoped admission regression in state::tests, plus the REQ lifecycle tests.
+  run_test_step "buzz-relay push runtime tests" \
+    cargo test -p buzz-relay --lib push_runtime:: -- --nocapture
+
+  run_test_step "buzz-relay operator listener tests" \
+    cargo test -p buzz-relay --lib operator_listener::tests:: -- --nocapture
+
   run_test_step "buzz-relay channel authorization tests" \
     cargo test -p buzz-relay --lib handlers::channel_authz:: -- --nocapture
 
@@ -177,6 +189,12 @@ run_unit_tests() {
 
   run_test_step "buzz-relay side-effects helper tests" \
     cargo test -p buzz-relay --lib handlers::side_effects::tests:: -- --nocapture
+
+  run_test_step "buzz-relay system channel scope tests" \
+    cargo test -p buzz-relay --lib handlers::system_channels::tests:: -- --nocapture
+
+  run_test_step "buzz-relay NIP-11 document tests" \
+    cargo test -p buzz-relay --lib nip11::tests:: -- --nocapture
 
   run_test_step "buzz-relay storage snapshot tests" \
     cargo test -p buzz-relay --lib storage_sweep::tests:: -- --nocapture
@@ -233,13 +251,30 @@ run_unit_tests() {
       handlers::req::tests::revoke_then_replacement_keeps_replacement_whole \
       handlers::req::tests::claims_after_connection_cleanup_are_refused \
       handlers::req::tests::dropped_terminal_frame_cancels_connection \
-      handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection
+      handlers::req::tests::revoke_dropped_terminal_frame_cancels_connection \
+      handlers::req::tests::count_fallback_covers_filters_that_can_match_private_deletions \
+      handlers::req::tests::group_state_t_and_creator_tags_reach_sql_only_for_group_state_kinds
 
   run_test_step "buzz-relay readiness tests" \
     cargo test -p buzz-relay --lib readiness::tests:: -- --nocapture
 
   run_test_step "buzz-relay admission regression test" \
     cargo test -p buzz-relay --lib state::tests::neither_a_confirmed_inactive_community_nor_a_failed_lookup_admits_the_socket -- --nocapture
+
+  run_test_step "buzz-relay archive revalidation fence test" \
+    cargo test -p buzz-relay --lib state::tests::periodic_revalidation_disconnects_inside_the_fenced_callback -- --exact --nocapture
+
+  run_test_step "buzz-relay bare disconnect fail-closed test" \
+    cargo test -p buzz-relay --lib state::tests::bare_community_disconnect_fails_closed_when_the_fence_is_unavailable -- --exact --nocapture
+
+  run_test_step "buzz-relay archived close-reason test" \
+    cargo test -p buzz-relay --lib connection::tests::send_loop_sends_policy_close_when_community_is_archived -- --exact --nocapture
+
+  run_test_step "buzz-relay community close first-writer tests" \
+    cargo test -p buzz-relay --lib state::tests::community_disconnect_then_nip_fi_keeps_community_deleted_reason -- --exact --nocapture
+
+  run_test_step "buzz-relay community close suppresses losing denial frame test" \
+    cargo test -p buzz-relay --lib state::tests::disconnect_community_wins_reason_losing_nip_fi_does_not_enqueue_frame -- --exact --nocapture
 
   run_test_step "buzz-relay router tests" \
     cargo test -p buzz-relay --lib router::tests:: -- --nocapture
@@ -264,6 +299,9 @@ run_unit_tests() {
 
   run_test_step "buzz-relay auth metrics contract tests" \
     cargo test -p buzz-relay --lib metrics::contract_tests:: -- --nocapture
+
+  run_test_step "buzz-relay partition alert series tests" \
+    cargo test -p buzz-relay --lib metrics::partition_alert_tests:: -- --nocapture
 
   local nip_fi_exact_tests=(
     audio::room::tests::roster_revisions_are_ordered_and_snapshot_is_authoritative

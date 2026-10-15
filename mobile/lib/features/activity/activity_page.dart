@@ -5,7 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 
 import '../../shared/identity_names/identity_names_provider.dart';
 import '../../shared/mentions/agent_identity_provider.dart';
@@ -253,8 +253,9 @@ class ActivityPage extends HookConsumerWidget {
 
       // Deep-link to the represented message: oldest unread in the group,
       // falling back to the latest event.
-      final readAt = resolveInboxItemReadAt(item, markerOf: markerOf);
-      final target = item.deepLinkTarget(readAt);
+      final target = item.deepLinkTarget(
+        (event) => isInboxEventRead(event, markerOf: markerOf),
+      );
       final thread = threadReferenceOf(target.tags);
       final threadRootId = isBroadcastReply(target.tags)
           ? null

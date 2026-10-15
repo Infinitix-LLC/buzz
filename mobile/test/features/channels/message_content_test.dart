@@ -1,3 +1,4 @@
+import 'package:buzz/features/channels/local_send_bubble_surface.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'package:http/testing.dart';
@@ -18,7 +19,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:hooks_riverpod/misc.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart' as audio;
-import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:buzz/shared/theme/buzz_icons.dart';
 import 'package:nostr/nostr.dart' as nostr;
 import 'package:buzz/features/channels/channel.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
@@ -34,10 +35,13 @@ import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/widgets/buzz_loading_indicator.dart';
 
+part 'message_content_bubble_cases.dart';
+
 Widget _testable(
   Widget child, {
   List<Override> overrides = const [],
   bool disableAnimations = false,
+  bool dark = false,
   VideoPreviewFrameLoader? videoPreviewFrameLoader,
 }) {
   return ProviderScope(
@@ -48,7 +52,7 @@ Widget _testable(
       ...overrides,
     ],
     child: MaterialApp(
-      theme: AppTheme.light(),
+      theme: dark ? AppTheme.dark() : AppTheme.light(),
       // Use MaterialApp.builder so the MediaQuery override (including
       // disableAnimations) applies to every pushed route, not just the
       // home scaffold.  Navigator-pushed routes (e.g. MediaVideoViewerPage)
@@ -413,6 +417,7 @@ class _TestChannelsNotifier extends ChannelsNotifier {
 }
 
 void main() {
+  bubbleContentTests();
   test('wide voice-note waveforms distribute bars across their full width', () {
     const width = 320.0;
     const sampleCount = 48;
@@ -2443,7 +2448,7 @@ Photos
           ),
           findsOneWidget,
         );
-        expect(find.byIcon(LucideIcons.play), findsOneWidget);
+        expect(find.byIcon(BuzzIcons.play), findsOneWidget);
       });
 
       testWidgets('derives a first frame for a posterless video event', (
@@ -2771,11 +2776,11 @@ Photos
           expect(find.text('engineering'), findsOneWidget);
           expect(find.text('buzz'), findsOneWidget);
           expect(find.text('buzz · cdcdcdcd'), findsNWidgets(2));
-          expect(find.byIcon(LucideIcons.messageSquare), findsOneWidget);
-          expect(find.byIcon(LucideIcons.hash), findsOneWidget);
-          expect(find.byIcon(LucideIcons.folderGit2), findsOneWidget);
-          expect(find.byIcon(LucideIcons.gitPullRequest), findsOneWidget);
-          expect(find.byIcon(LucideIcons.circleDot), findsOneWidget);
+          expect(find.byIcon(BuzzIcons.messageSquare), findsOneWidget);
+          expect(find.byIcon(BuzzIcons.hash), findsOneWidget);
+          expect(find.byIcon(BuzzIcons.folderGit2), findsOneWidget);
+          expect(find.byIcon(BuzzIcons.gitPullRequest), findsOneWidget);
+          expect(find.byIcon(BuzzIcons.circleDot), findsOneWidget);
           expect(
             find.bySemanticsLabel(
               'Open message cdcdcdcd in channel engineering',
@@ -2853,7 +2858,7 @@ Photos
           ),
         );
 
-        expect(find.byIcon(LucideIcons.bot), findsOneWidget);
+        expect(find.byIcon(BuzzIcons.bot), findsOneWidget);
         expect(find.text('@'), findsNothing);
         expect(find.text('Helper Bot'), findsOneWidget);
       });
@@ -2871,7 +2876,7 @@ Photos
           ),
         );
 
-        expect(find.byIcon(LucideIcons.bot), findsOneWidget);
+        expect(find.byIcon(BuzzIcons.bot), findsOneWidget);
         expect(find.text('Helper Bot'), findsOneWidget);
         expect(_allRichText(tester), isNot(contains('Bot Bot')));
       });
@@ -2984,7 +2989,7 @@ Photos
           ),
         );
 
-        expect(find.byIcon(LucideIcons.hash), findsOneWidget);
+        expect(find.byIcon(BuzzIcons.hash), findsOneWidget);
         expect(find.text('general'), findsOneWidget);
         expect(find.text('#general'), findsNothing);
       });
@@ -3054,7 +3059,7 @@ Photos
           ),
         );
 
-        expect(find.byIcon(LucideIcons.hash), findsOneWidget);
+        expect(find.byIcon(BuzzIcons.hash), findsOneWidget);
         expect(find.text('unknown'), findsOneWidget);
         expect(find.text('#unknown'), findsNothing);
       });
@@ -3100,7 +3105,7 @@ Photos
         );
 
         expect(_findRich('#2959'), findsOneWidget);
-        expect(find.byIcon(LucideIcons.hash), findsNothing);
+        expect(find.byIcon(BuzzIcons.hash), findsNothing);
         expect(_hasNestedPlaceholder(tester), isFalse);
       });
 
@@ -3152,7 +3157,7 @@ Photos
 
         // Excluding the link-label scope must not disable the components
         // everywhere else: the bare tokens keep their pills.
-        expect(find.byIcon(LucideIcons.hash), findsOneWidget);
+        expect(find.byIcon(BuzzIcons.hash), findsOneWidget);
         expect(find.text('@'), findsOneWidget);
         expect(find.text('Alice'), findsOneWidget);
         expect(_findRich('#2959'), findsOneWidget);
