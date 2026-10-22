@@ -20,6 +20,14 @@ pub mod deletion;
 pub mod dm;
 /// Event storage and retrieval.
 pub mod event;
+/// App-owned push enqueue and channel TTL refresh for inserted events.
+pub(crate) mod event_follow_up;
+/// Per-community NIP-FI issuer bindings.
+pub mod nip_fi_binding;
+
+#[cfg(test)]
+mod event_follow_up_postgres_tests;
+
 /// Home feed queries.
 pub mod feed;
 /// Git repository name registry (NIP-34 kind:30617).
@@ -72,3 +80,9 @@ mod artifact_query;
 
 #[cfg(test)]
 mod artifact_postgres_tests;
+
+#[cfg(test)]
+mod legacy_channel_types_postgres_tests;
+
+#[cfg(test)]
+mod admission_postgres_tests;

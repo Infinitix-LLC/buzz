@@ -1193,6 +1193,8 @@ pub struct AppState {
     pub community_connections: Arc<CommunityConnectionRegistry>,
     /// Stops only the periodic lifecycle revalidator during graceful shutdown.
     pub community_revalidator_cancel: CancellationToken,
+    /// Cancels push claims and in-flight delivery on process shutdown.
+    pub push_cancel: CancellationToken,
     /// Test/telemetry counter for archive disconnect publication attempts.
     pub community_disconnect_publish_attempts: Arc<AtomicU64>,
     /// Semaphore limiting total concurrent connections.
@@ -1306,7 +1308,9 @@ pub struct AppState {
     /// Key: (community_id, agent_pubkey_bytes, owner_pubkey_bytes). Value: is_owner.
     /// `agent_owner_pubkey` is immutable inside one community, so a long TTL
     /// (5 min) is safe once the community label is part of the key.
-    /// Prevents repeated DB lookups from bursty observer traffic.
+    /// Prevents repeated DB lookups from bursty observer traffic, and lets
+    /// `materialize_nip_oa_owner` skip its writes for a known mapping. Sized
+    /// for every concurrently active agent so per-request HTTP agents hit.
     #[allow(clippy::type_complexity)]
     pub observer_owner_cache: Arc<moka::sync::Cache<(CommunityId, Vec<u8>, Vec<u8>), bool>>,
     /// Cache for the `author_type` metric label on the ingest path.
@@ -1315,6 +1319,23 @@ pub struct AppState {
     /// first-write-wins and set during auth before an agent's first event,
     /// so a short TTL only bounds staleness for the rare backfill race.
     pub author_type_cache: Arc<moka::sync::Cache<(CommunityId, Vec<u8>), bool>>,
+    /// Ephemeral-path cache of `is_serving_active` (community not archived or
+    /// deleted). Key: community. TTL only (10s). Persistent ingest keeps the
+    /// uncached read as its durable write fence; on the ephemeral path archive
+    /// also disconnects the community's live sockets.
+    pub serving_active_cache: Arc<moka::sync::Cache<CommunityId, bool>>,
+    /// Ephemeral-path cache of the raw ban/timeout row, not the verdict, so a
+    /// timeout still lifts the moment `muted_until` passes. (`banned` is
+    /// computed at read time, so an expiring ban can outlive its expiry by up
+    /// to the TTL.) Key: (community, pubkey bytes). The 30s TTL is the only
+    /// staleness bound: on every pod and for every restriction writer, the
+    /// ephemeral path sees a ban/timeout change within 30s. As a best effort,
+    /// signed moderation commands (9040–9043) also drop the target's own entry
+    /// on the pod that handles them; owned agents' entries, other pods, and the
+    /// admin/report paths just age out. Persistent ingest stays uncached.
+    #[allow(clippy::type_complexity)]
+    pub restriction_cache:
+        Arc<moka::sync::Cache<(CommunityId, Vec<u8>), buzz_db::moderation::RestrictionState>>,
 
     /// Runtime conformance tracer. Production binds [`crate::conformance::NoopTracer`]
     /// (zero cost). Conformance tests bind [`crate::conformance::JsonlTracer`] to
@@ -1358,6 +1379,10 @@ pub struct AppState {
     /// 4) and HTTP admission (`nip_fi_http`): one `Arc`, never a second map.
     pub nip_fi_deny_map: Option<Arc<buzz_auth::NipFiDenyMap>>,
 
+    /// The database community resolver (`BUZZ_NIP_FI_COMMUNITY_SOURCE=database`),
+    /// installed by `main.rs`; `None` resolves from `config.nip_fi.communities`.
+    pub nip_fi_resolver: Option<Arc<crate::nip_fi_resolver::DatabaseResolver>>,
+
     /// Command JWT verifier for the NIP-FI admin disconnect endpoint.
     ///
     /// `None` when mode is `Off` (no command API is reachable).  When
@@ -1378,6 +1403,17 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The NIP-FI community source admission resolves against.
+    pub(crate) fn nip_fi_communities(&self) -> crate::nip_fi_core::Communities<'_> {
+        use crate::nip_fi_config::CommunitySource;
+        use crate::nip_fi_core::Communities;
+        match (self.config.nip_fi.source, &self.nip_fi_resolver) {
+            (CommunitySource::Env, _) => Communities::Env(&self.config.nip_fi.communities),
+            (CommunitySource::Database, Some(resolver)) => Communities::Database(resolver),
+            (CommunitySource::Database, None) => Communities::Unavailable,
+        }
+    }
+
     /// Constructs `AppState` from its component services.
     ///
     /// Returns `(state, audit_shutdown)`. The caller should call
@@ -1479,6 +1515,7 @@ impl AppState {
             conn_manager: Arc::new(ConnectionManager::new()),
             community_connections: Arc::new(CommunityConnectionRegistry::new()),
             community_revalidator_cancel: CancellationToken::new(),
+            push_cancel: CancellationToken::new(),
             community_disconnect_publish_attempts: Arc::new(AtomicU64::new(0)),
             conn_semaphore: Arc::new(Semaphore::new(max_connections)),
             handler_semaphore: Arc::new(Semaphore::new(max_concurrent_handlers)),
@@ -1543,7 +1580,7 @@ impl AppState {
             media_uploads_in_flight: Arc::new(DashMap::new()),
             observer_owner_cache: Arc::new(
                 moka::sync::Cache::builder()
-                    .max_capacity(1_000)
+                    .max_capacity(100_000)
                     .time_to_live(std::time::Duration::from_secs(300))
                     .build(),
             ),
@@ -1551,6 +1588,18 @@ impl AppState {
                 moka::sync::Cache::builder()
                     .max_capacity(10_000)
                     .time_to_live(std::time::Duration::from_secs(300))
+                    .build(),
+            ),
+            serving_active_cache: Arc::new(
+                moka::sync::Cache::builder()
+                    .max_capacity(10_000)
+                    .time_to_live(std::time::Duration::from_secs(10))
+                    .build(),
+            ),
+            restriction_cache: Arc::new(
+                moka::sync::Cache::builder()
+                    .max_capacity(100_000)
+                    .time_to_live(std::time::Duration::from_secs(30))
                     .build(),
             ),
             // Default to NoopTracer: production builds pay zero cost.
@@ -1566,6 +1615,7 @@ impl AppState {
             // `main.rs` after startup validation.  `None` is safe before that
             // call: the endpoint returns 503 when the verifier is absent.
             nip_fi_deny_map: None,
+            nip_fi_resolver: None,
             nip_fi_command_verifier: None,
             nip_fi_command_replay,
             nip_fi_publish_tasks: tokio_util::task::TaskTracker::new(),
@@ -1585,6 +1635,8 @@ impl AppState {
     /// the readiness gauge on its next request.
     pub fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        self.push_cancel.cancel();
+        self.db.cancel_push_enqueue();
     }
 
     #[cfg(test)]
@@ -1613,9 +1665,11 @@ impl AppState {
 
     /// Snapshot the last completed audit without accessing the database.
     ///
-    /// Periodic refresh failures retain the last-known-good audit by design;
-    /// operators should alert on staleness of
-    /// `buzz_partition_audit_last_success_timestamp_seconds`.
+    /// Periodic refresh failures retain the last-known-good audit by design.
+    /// Alert on the age of
+    /// `buzz_partition_audit_last_success_timestamp_seconds`, which failed
+    /// audits keep exported, and on audit runs stopping. See
+    /// `docs/partition-catalog-monitoring.md`.
     pub fn partition_audit_snapshot(&self) -> Option<buzz_db::partition::PartitionAudit> {
         let cached = match self.partition_audit.read() {
             Ok(cached) => cached,
@@ -1650,6 +1704,53 @@ impl AppState {
         let result = self.db.is_member(community_id, channel_id, pubkey).await?;
         self.membership_cache.insert(key, result);
         Ok(result)
+    }
+
+    /// `is_serving_active` with a 10-second cache, for the ephemeral path only.
+    /// Errors are not cached.
+    pub async fn is_serving_active_cached(
+        &self,
+        community_id: CommunityId,
+    ) -> Result<bool, buzz_db::DbError> {
+        if let Some(cached) = self.serving_active_cache.get(&community_id) {
+            metrics::counter!("buzz_serving_active_cache_hits_total").increment(1);
+            return Ok(cached);
+        }
+        metrics::counter!("buzz_serving_active_cache_misses_total").increment(1);
+        let result = buzz_deletion::store(&self.db)
+            .is_serving_active(community_id)
+            .await?;
+        self.serving_active_cache.insert(community_id, result);
+        Ok(result)
+    }
+
+    /// `moderation_restriction_state` with a 30-second cache, for the
+    /// ephemeral path only. Errors are not cached.
+    pub async fn restriction_state_cached(
+        &self,
+        community_id: CommunityId,
+        pubkey: &[u8],
+    ) -> Result<buzz_db::moderation::RestrictionState, buzz_db::DbError> {
+        let key = (community_id, pubkey.to_vec());
+        if let Some(cached) = self.restriction_cache.get(&key) {
+            metrics::counter!("buzz_restriction_cache_hits_total").increment(1);
+            return Ok(cached);
+        }
+        metrics::counter!("buzz_restriction_cache_misses_total").increment(1);
+        let result = self
+            .db
+            .moderation_restriction_state(community_id, pubkey)
+            .await?;
+        self.restriction_cache.insert(key, result.clone());
+        Ok(result)
+    }
+
+    /// Best-effort drop of a pubkey's cached restriction row after a signed
+    /// ban, unban, timeout or untimeout. This pod and this key only; the
+    /// 30-second TTL is the actual bound everywhere else.
+    pub fn invalidate_restriction_cache(&self, community_id: CommunityId, pubkey: &[u8]) {
+        self.restriction_cache
+            .invalidate(&(community_id, pubkey.to_vec()));
     }
 
     /// Invalidate caches after a membership change (add/remove member).
@@ -2316,15 +2417,13 @@ async fn log_audit_entry(audit: &buzz_audit::AuditService, entry: buzz_audit::Ne
                 metrics::histogram!("buzz_audit_log_seconds").record(t.elapsed().as_secs_f64());
                 return;
             }
-            Err(buzz_audit::AuditError::Database(sqlx::Error::Database(database_error)))
-                if database_error.code().as_deref() == Some("55P03") =>
-            {
+            Err(error) if is_retryable_append_failure(&error) => {
                 retries += 1;
                 metrics::counter!("buzz_audit_log_lock_retries_total").increment(1);
                 tracing::warn!(
                     retries,
                     retry_delay_ms,
-                    "Audit advisory lock timed out; preserving entry for retry"
+                    "Audit append timed out; preserving entry for retry: {error}"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
                 retry_delay_ms = (retry_delay_ms * 2).min(1_000);
@@ -2336,6 +2435,25 @@ async fn log_audit_entry(audit: &buzz_audit::AuditService, entry: buzz_audit::Ne
             }
         }
     }
+}
+
+/// Whether an audit append was rolled back by a timeout: `lock_timeout`
+/// (`55P03`) while waiting on the audit-chain lock or the community admission
+/// lock taken before it, or `statement_timeout` (`57014`) on any statement of
+/// the append transaction — a lock wait when the lock timeout is disabled or
+/// longer than the writer cap, or a slow head read or insert. The whole
+/// append is one transaction, so either code means nothing was written; the
+/// entry is kept and retried. `buzz_audit_log_lock_retries_total` keeps its
+/// name for dashboard continuity and counts both codes.
+/// Admission refusal (`AccessDenied`) is terminal: a quiescing or fenced
+/// community refuses for good.
+fn is_retryable_append_failure(error: &buzz_audit::AuditError) -> bool {
+    let database_error = match error {
+        buzz_audit::AuditError::Database(sqlx::Error::Database(e))
+        | buzz_audit::AuditError::Admission(buzz_db::DbError::Sqlx(sqlx::Error::Database(e))) => e,
+        _ => return false,
+    };
+    matches!(database_error.code().as_deref(), Some("55P03" | "57014"))
 }
 
 impl std::fmt::Debug for AppState {
@@ -2844,7 +2962,51 @@ pub(crate) mod tests {
         Arc::new(state)
     }
 
+    /// The lock an audit-retry test holds while the worker times out on it.
+    #[derive(Clone, Copy)]
+    enum HeldAuditLock {
+        /// The per-community audit-chain lock (`buzz_audit:<community>`).
+        AuditChain,
+        /// The community deletion lock, held EXCLUSIVE as `begin_quiescing`,
+        /// `fence` and `abort` do; audit admission takes it SHARED first.
+        CommunityDeletion,
+    }
+
+    /// Which timeout cancels the audit append while it waits on the lock.
+    #[derive(Clone, Copy)]
+    enum AuditWaitTimeout {
+        /// `lock_timeout` (55P03).
+        Lock,
+        /// `statement_timeout` with `lock_timeout` disabled (57014), as under
+        /// `BUZZ_DB_LOCK_TIMEOUT_MS=0` with the writer statement cap.
+        Statement,
+    }
+
     async fn audit_worker_retries_lock_timeout_until_original_entry_is_appended_once() {
+        assert_audit_worker_retries_lock_timeout(HeldAuditLock::AuditChain, AuditWaitTimeout::Lock)
+            .await;
+    }
+
+    async fn audit_worker_retries_admission_lock_timeout_until_original_entry_is_appended_once() {
+        assert_audit_worker_retries_lock_timeout(
+            HeldAuditLock::CommunityDeletion,
+            AuditWaitTimeout::Lock,
+        )
+        .await;
+    }
+
+    async fn audit_worker_retries_statement_timeout_until_original_entry_is_appended_once() {
+        assert_audit_worker_retries_lock_timeout(
+            HeldAuditLock::AuditChain,
+            AuditWaitTimeout::Statement,
+        )
+        .await;
+    }
+
+    async fn assert_audit_worker_retries_lock_timeout(
+        held: HeldAuditLock,
+        timeout: AuditWaitTimeout,
+    ) {
         let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let observer = sqlx::PgPool::connect(&database_url)
             .await
@@ -2856,11 +3018,18 @@ pub(crate) mod tests {
             .after_connect(move |conn, _meta| {
                 let application_name = hook_application_name.clone();
                 Box::pin(async move {
+                    let (lock_timeout, statement_timeout) = match timeout {
+                        AuditWaitTimeout::Lock => ("100", "0"),
+                        AuditWaitTimeout::Statement => ("0", "100"),
+                    };
                     sqlx::query(
                         "SELECT set_config('application_name', $1, false), \
-                                set_config('lock_timeout', '100', false)",
+                                set_config('lock_timeout', $2, false), \
+                                set_config('statement_timeout', $3, false)",
                     )
                     .bind(application_name)
+                    .bind(lock_timeout)
+                    .bind(statement_timeout)
                     .execute(&mut *conn)
                     .await?;
                     Ok(())
@@ -2889,11 +3058,21 @@ pub(crate) mod tests {
         // Mirrors buzz_audit::service::AUDIT_LOCK_NAMESPACE.
         let lock_key = format!("buzz_audit:{community_id}");
         let mut holder = observer.acquire().await.expect("acquire lock holder");
-        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
-            .bind(&lock_key)
-            .execute(&mut *holder)
-            .await
-            .expect("hold community audit lock");
+        match held {
+            HeldAuditLock::AuditChain => {
+                sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+                    .bind(&lock_key)
+                    .execute(&mut *holder)
+                    .await
+            }
+            HeldAuditLock::CommunityDeletion => {
+                sqlx::query("SELECT pg_advisory_lock(community_deletion_lock_key($1))")
+                    .bind(community_id)
+                    .execute(&mut *holder)
+                    .await
+            }
+        }
+        .expect("hold lock");
 
         let audit = Arc::new(AuditService::new(audit_pool));
         let worker = tokio::spawn({
@@ -2912,7 +3091,7 @@ pub(crate) mod tests {
                     "SELECT EXISTS (\
                          SELECT 1 FROM pg_stat_activity \
                          WHERE application_name = $1 \
-                           AND query LIKE 'SELECT pg_advisory_lock%' \
+                           AND query LIKE 'SELECT pg_advisory_xact_lock%' \
                            AND wait_event = 'advisory'\
                      )",
                 )
@@ -2934,11 +3113,21 @@ pub(crate) mod tests {
         .await
         .expect("audit worker never retried after lock_timeout");
 
-        sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
-            .bind(&lock_key)
-            .execute(&mut *holder)
-            .await
-            .expect("release community audit lock");
+        match held {
+            HeldAuditLock::AuditChain => {
+                sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+                    .bind(&lock_key)
+                    .execute(&mut *holder)
+                    .await
+            }
+            HeldAuditLock::CommunityDeletion => {
+                sqlx::query("SELECT pg_advisory_unlock(community_deletion_lock_key($1))")
+                    .bind(community_id)
+                    .execute(&mut *holder)
+                    .await
+            }
+        }
+        .expect("release lock");
         tokio::time::timeout(std::time::Duration::from_secs(3), worker)
             .await
             .expect("audit worker did not finish after lock release")
@@ -2972,6 +3161,21 @@ pub(crate) mod tests {
         #[ignore = "requires Postgres"]
         async fn audit_worker_retries_lock_timeout_until_original_entry_is_appended_once() {
             super::audit_worker_retries_lock_timeout_until_original_entry_is_appended_once().await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn audit_worker_retries_admission_lock_timeout_until_original_entry_is_appended_once()
+        {
+            super::audit_worker_retries_admission_lock_timeout_until_original_entry_is_appended_once()
+                .await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn audit_worker_retries_statement_timeout_until_original_entry_is_appended_once() {
+            super::audit_worker_retries_statement_timeout_until_original_entry_is_appended_once()
+                .await;
         }
     }
 

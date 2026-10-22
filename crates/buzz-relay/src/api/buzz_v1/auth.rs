@@ -110,6 +110,7 @@ pub(super) async fn authorize(
             body.is_some(),
         ),
     )
+    .await
     .map_err(|response| {
         if state.config.nip_fi.mode.restricts() {
             // Preserve the shared NIP-FI wire contract, not just its status.
@@ -161,9 +162,12 @@ pub(super) async fn recheck(
     Ok(())
 }
 
+/// Largest serialized API response; a larger one is a 503.
+pub(super) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
 pub(super) fn response(value: impl serde::Serialize) -> Result<Response, Error> {
     let bytes = serde_json::to_vec(&value).map_err(|_| Error::unavailable())?;
-    if bytes.len() > 1024 * 1024 {
+    if bytes.len() > MAX_RESPONSE_BYTES {
         return Err(Error::unavailable());
     }
     Ok((

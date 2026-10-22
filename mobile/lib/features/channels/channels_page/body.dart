@@ -183,13 +183,13 @@ class _SliverChannelsList extends HookConsumerWidget {
       });
     }, [readState.isReady, readState.pubkey, visibleChannels]);
 
-    final unreadState = _computeUnreadChannelState(
+    final unreadState = computeUnreadChannelIds(
       channels: visibleChannels,
       readState: readState,
       channelsNotifier: ref.read(channelsProvider.notifier),
     );
     final unreadChannelIds = {
-      for (final channelId in unreadState.ids)
+      for (final channelId in unreadState)
         if (seedCompleteForPubkey ||
             readState.effectiveTimestamp(channelId) != null)
           channelId,
@@ -254,6 +254,25 @@ class _SliverChannelsList extends HookConsumerWidget {
       ),
       sliver: SliverList.list(
         children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: Grid.gutter),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                key: const Key('browse-channels-button'),
+                icon: const Icon(BuzzIcons.compass),
+                label: const Text('Browse channels'),
+                onPressed: () => showBuzzModalBottomSheet<void>(
+                  context: context,
+                  title: 'Browse channels',
+                  constraints: _quickActionSheetConstraints(context),
+                  isScrollControlled: true,
+                  showDragHandle: true,
+                  builder: (_) => const _BrowseChannelsSheet(),
+                ),
+              ),
+            ),
+          ),
           if (visibleChannels.isEmpty)
             const _EmptyState()
           else ...[
@@ -261,7 +280,6 @@ class _SliverChannelsList extends HookConsumerWidget {
             if (starredStreamChannels.isNotEmpty)
               _ChannelSection(
                 title: 'Starred',
-                icon: BuzzIcons.star,
                 showTopDivider: false,
                 expanded: starredExpanded.value,
                 onToggle: () => starredExpanded.value = !starredExpanded.value,
@@ -372,7 +390,6 @@ class _SliverChannelsList extends HookConsumerWidget {
               ),
             _ChannelSection(
               title: 'Channels',
-              icon: BuzzIcons.hash,
               showTopDivider:
                   starredStreamChannels.isNotEmpty || userSections.isNotEmpty,
               expanded: channelsExpanded.value,
@@ -388,7 +405,6 @@ class _SliverChannelsList extends HookConsumerWidget {
             ),
             _ChannelSection(
               title: 'DMs',
-              icon: BuzzIcons.messagesSquare,
               showTopDivider: true,
               expanded: dmsExpanded.value,
               onToggle: () => dmsExpanded.value = !dmsExpanded.value,

@@ -184,16 +184,18 @@ pub(crate) enum LockType {
     PushGate,
     Deletion,
     MigrationSchemaSafety,
+    PartitionMaintenance,
 }
 
 impl LockType {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Replacement,
         Self::Membership,
         Self::PushGate,
         Self::Deletion,
         Self::MigrationSchemaSafety,
+        Self::PartitionMaintenance,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -203,6 +205,7 @@ impl LockType {
             Self::PushGate => "push_gate",
             Self::Deletion => "deletion",
             Self::MigrationSchemaSafety => "migration_schema_safety",
+            Self::PartitionMaintenance => "partition_maintenance",
         }
     }
 }
@@ -243,7 +246,6 @@ impl Outcome {
 pub(crate) enum TransactionOperation {
     ReplaceParameterizedEvent,
     ReplaceAddressableEvent,
-    PublishNip43MembershipLocked,
     AcceptPushLeaseEvent,
     BeginCommunityDeletionQuiescing,
     FenceCommunityDeletion,
@@ -253,10 +255,9 @@ pub(crate) enum TransactionOperation {
 
 impl TransactionOperation {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::ReplaceParameterizedEvent,
         Self::ReplaceAddressableEvent,
-        Self::PublishNip43MembershipLocked,
         Self::AcceptPushLeaseEvent,
         Self::BeginCommunityDeletionQuiescing,
         Self::FenceCommunityDeletion,
@@ -268,7 +269,6 @@ impl TransactionOperation {
         match self {
             Self::ReplaceParameterizedEvent => "replace_parameterized_event",
             Self::ReplaceAddressableEvent => "replace_addressable_event",
-            Self::PublishNip43MembershipLocked => "publish_nip43_membership_locked",
             Self::AcceptPushLeaseEvent => "accept_push_lease_event",
             Self::BeginCommunityDeletionQuiescing => "begin_community_deletion_quiescing",
             Self::FenceCommunityDeletion => "fence_community_deletion",
@@ -285,7 +285,6 @@ impl TransactionOperation {
         match self {
             Self::ReplaceParameterizedEvent
             | Self::ReplaceAddressableEvent
-            | Self::PublishNip43MembershipLocked
             | Self::AcceptPushLeaseEvent
             | Self::BeginCommunityDeletionQuiescing
             | Self::FenceCommunityDeletion => true,
@@ -297,7 +296,6 @@ impl TransactionOperation {
         match self {
             Self::ReplaceParameterizedEvent
             | Self::ReplaceAddressableEvent
-            | Self::PublishNip43MembershipLocked
             | Self::AcceptPushLeaseEvent => WriterOperation::EventWrite,
             Self::BeginCommunityDeletionQuiescing
             | Self::FenceCommunityDeletion
@@ -671,6 +669,7 @@ mod tests {
                 "push_gate",
                 "deletion",
                 "migration_schema_safety",
+                "partition_maintenance",
             ]
         );
         assert_eq!(
@@ -682,7 +681,6 @@ mod tests {
             [
                 "replace_parameterized_event",
                 "replace_addressable_event",
-                "publish_nip43_membership_locked",
                 "accept_push_lease_event",
                 "begin_community_deletion_quiescing",
                 "fence_community_deletion",
@@ -1502,8 +1500,10 @@ mod tests {
             .create_community_with_owner(
                 &format!("pool-operation-matrix-{}.invalid", Uuid::new_v4().simple()),
                 &"b".repeat(64),
+                &nostr::Keys::generate(),
             )
-            .await;
+            .await
+            .map(|write| write.outcome);
         let _ = writer_db
             .archive_community_owned_by(
                 "pool-operation-matrix.invalid",

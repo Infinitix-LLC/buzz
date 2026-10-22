@@ -156,15 +156,6 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
     assert!(event.contains("WriterOperation::Authorization"));
     assert!(event.contains("WriterOperation::SubscriptionHistory"));
     assert!(event.contains("ReaderOperation::SubscriptionHistory"));
-    let backfill_d_tags = event
-        .split_once("pub async fn backfill_d_tags")
-        .expect("event store must expose the startup d-tag backfill")
-        .1
-        .split_once("/// Soft-delete NIP-29 discovery events")
-        .expect("d-tag backfill must precede discovery deletion")
-        .0;
-    assert!(backfill_d_tags.contains("WriterOperation::Bootstrap"));
-    assert!(backfill_d_tags.contains("execute(&mut *connection)"));
     let soft_delete_discovery = event
         .split_once("pub async fn soft_delete_discovery_events")
         .expect("event store must expose discovery-event deletion")
@@ -207,48 +198,47 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
     assert!(!thread_metadata.contains("fetch_optional(pool)"));
 
     let channel = include_str!("../src/store/channel.rs");
-    assert!(channel.contains("async fn begin_event_write_transaction("));
-    assert!(channel.contains("async fn acquire_event_write_connection("));
+    assert!(channel.contains("begin_community_write_transaction("));
     for (start, end, expected) in [
         (
             "pub async fn create_channel(\n",
             "/// Creates a channel with a client-supplied UUID",
-            "begin_event_write_transaction(pool)",
+            "begin_community_write_transaction(",
         ),
         (
             "pub async fn create_channel_with_id(\n",
             "/// Fetches a channel record by `(community_id, id)`",
-            "begin_event_write_transaction(pool)",
+            "begin_community_write_transaction(",
         ),
         (
             "pub async fn update_channel(\n",
             "/// Sets the topic for a channel",
-            "begin_event_write_transaction(pool)",
+            "begin_community_write_transaction(",
         ),
         (
             "pub async fn set_topic(\n",
             "/// Sets the purpose for a channel",
-            "acquire_event_write_connection(pool)",
+            "begin_community_write_transaction(",
         ),
         (
             "pub async fn set_purpose(\n",
             "/// Archives a channel",
-            "acquire_event_write_connection(pool)",
+            "begin_community_write_transaction(",
         ),
         (
             "pub async fn archive_channel(\n",
             "/// Unarchives a channel",
-            "acquire_event_write_connection(pool)",
+            "begin_community_write_transaction(",
         ),
         (
             "pub async fn unarchive_channel(\n",
             "/// Soft-delete a channel",
-            "acquire_event_write_connection(pool)",
+            "begin_community_write_transaction(",
         ),
         (
             "pub async fn soft_delete_channel(\n",
             "/// Archive ephemeral channels",
-            "acquire_event_write_connection(pool)",
+            "begin_community_write_transaction(",
         ),
     ] {
         let function = channel
@@ -441,7 +431,9 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
 
     let relay_main = include_str!("../../buzz-relay/src/main.rs");
     assert!(relay_main.contains("pool_state.db.refresh_pool_waiter_metrics();"));
-    assert!(relay_main.contains(".ensure_configured_community_for_bootstrap("));
+    assert!(relay_main.contains("ensure_deployment_community(&db,"));
+    let provisioning = include_str!("../../buzz-relay/src/handlers/community_provisioning.rs");
+    assert!(provisioning.contains(".ensure_configured_community_for_bootstrap("));
 
     let runtime = include_str!("../src/runtime/mod.rs");
     assert!(runtime.contains("observability::refresh_pool_waiters(self.read_pool.is_some())"));
@@ -472,7 +464,7 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
         .next()
         .expect("usage production source");
     let usage_leader_lock = usage_production
-        .split_once("pub async fn try_lock_usage_metrics(")
+        .split_once("pub async fn try_lock_session_leader(")
         .expect("usage store must expose the legacy leader-lock acquisition")
         .1
         .split_once("pub async fn usage_community_count(")
@@ -719,19 +711,6 @@ fn event_write_paths_include_tenant_local_chokepoint_calls() {
         "snapshot publication locks must include a tenant-local chokepoint call"
     );
 
-    let relay_members = include_str!("../src/store/relay_members.rs");
-    let publish_snapshot = relay_members
-        .split_once("pub async fn publish_nip43_membership_locked(\n")
-        .expect("relay_members must expose publish_nip43_membership_locked")
-        .1
-        .split_once("}\n\n#[cfg(test)]")
-        .expect("membership publish path must precede tests")
-        .0;
-    assert!(
-        has_any_tenant_local_chokepoint(publish_snapshot),
-        "NIP-43 membership publication must include a tenant-local chokepoint call"
-    );
-
     let push = include_str!("../src/store/push.rs");
     let accept_lease = push
         .split_once("pub async fn accept_lease_event(\n")
@@ -818,19 +797,6 @@ fn legacy_compatibility_metrics_remain_pinned_to_the_preexisting_event_write_ent
         );
     }
 
-    let relay_members = include_str!("../src/store/relay_members.rs");
-    let publish_snapshot = relay_members
-        .split_once("pub async fn publish_nip43_membership_locked(\n")
-        .expect("relay_members must expose publish_nip43_membership_locked")
-        .1
-        .split_once("}\n\n#[cfg(test)]")
-        .expect("membership publish path must precede tests")
-        .0;
-    assert!(
-        publish_snapshot.contains(COMMUNITY_CHOKEPOINT_LEGACY_MARKER),
-        "NIP-43 membership publication must preserve the legacy compatibility population"
-    );
-
     let push = include_str!("../src/store/push.rs");
     let accept_lease = push
         .split_once("pub async fn accept_lease_event(\n")
@@ -903,21 +869,24 @@ const GUARDED_TABLE_WRITE_MARKERS: [&str; 9] = [
 ];
 
 const COMMUNITY_CHOKEPOINT_MARKER: &str = "begin_community_event_write_transaction(";
+const GENERAL_COMMUNITY_CHOKEPOINT_MARKER: &str = "begin_community_write_transaction(";
+const SWEEP_COMMUNITY_CHOKEPOINT_MARKER: &str = "begin_community_sweep_transaction(";
 const COMMUNITY_CHOKEPOINT_LEGACY_MARKER: &str =
     "begin_community_event_write_transaction_with_legacy_metrics(";
 
 fn has_any_tenant_local_chokepoint(source: &str) -> bool {
     source.contains(COMMUNITY_CHOKEPOINT_MARKER)
+        || source.contains(SWEEP_COMMUNITY_CHOKEPOINT_MARKER)
+        || source.contains(GENERAL_COMMUNITY_CHOKEPOINT_MARKER)
         || source.contains(COMMUNITY_CHOKEPOINT_LEGACY_MARKER)
 }
 
 const ADMITTED_TX_SIGNATURE_MARKERS: [&str; 2] = ["&mut AdmittedTx", "&mut crate::AdmittedTx"];
 
 // Narrow reviewed exceptions for non-serving verification probes only.
-const GUARDED_WRITE_FUNCTION_EXCEPTIONS: [&str; 3] = [
+const GUARDED_WRITE_FUNCTION_EXCEPTIONS: [&str; 2] = [
     "pub async fn verify_floor_guard_behavior(",
     "pub async fn verify_channel_roster_fence_behavior(",
-    "pub async fn backfill_d_tags(&self) -> Result<u64> {",
 ];
 
 const GUARDED_TX_ADAPTER_METHOD_PINS: [(&str, &str); 1] = [(
@@ -950,19 +919,28 @@ fn fn_signature_starts_here(trimmed_line: &str) -> bool {
 /// signature to the doc comment or attributes of the next function, so a
 /// following function's docs (which may quote SQL) are never attributed to the
 /// function before it.
+///
+/// Signatures and attributes are found in the masked view (see
+/// [`mask_comments_and_literals`]), so an `fn` line inside a comment or a
+/// multiline string never splits a function. Doc comments are blank in that
+/// view, so `///` lead-ins are read from the original line.
 fn function_slices(production_source: &str) -> Vec<&str> {
+    let masked = mask_comments_and_literals(production_source);
     // (signature offset, offset where the next function's lead-in begins)
     let mut starts = Vec::new();
     let mut lead_ins = Vec::new();
     let mut lead_in: Option<usize> = None;
     let mut offset = 0usize;
-    for line in production_source.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
+    for (line, code) in production_source
+        .split_inclusive('\n')
+        .zip(masked.split_inclusive('\n'))
+    {
+        let trimmed = code.trim_start();
+        let indent = code.len() - trimmed.len();
         if fn_signature_starts_here(trimmed) {
             starts.push(offset + indent);
             lead_ins.push(lead_in.take().unwrap_or(offset + indent));
-        } else if trimmed.starts_with("///") || trimmed.starts_with("#[") {
+        } else if line.trim_start().starts_with("///") || trimmed.starts_with("#[") {
             lead_in.get_or_insert(offset);
         } else {
             lead_in = None;
@@ -1130,7 +1108,7 @@ fn serving_table_policy_requires_admitted_tx_not_raw_transactions() {
     let source = r#"
 pub(crate) async fn raw_transaction_writer(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) {
     sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
-        .execute(&mut **tx)
+        .execute(tx.conn())
         .await
         .expect("write");
 }
@@ -1143,7 +1121,7 @@ pub(crate) async fn raw_connection_writer(conn: &mut sqlx::PgConnection) {
 pub(crate) async fn admitted_writer(tx: &mut AdmittedTx) {
     sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
         .bind(tx.community().as_uuid())
-        .execute(&mut **tx)
+        .execute(tx.conn())
         .await
         .expect("write");
 }
@@ -1161,76 +1139,80 @@ pub(crate) async fn admitted_writer(tx: &mut AdmittedTx) {
     );
 }
 
-#[test]
-fn admitted_tx_is_constructed_only_by_admitting_constructors() {
-    // The fields are private to `runtime/admitted_tx.rs`, so only that file can
-    // build the value. Pin that each function there that builds it also admits
-    // the transaction it wraps, so a new unguarded constructor cannot slip in.
-    let source = include_str!("../src/runtime/admitted_tx.rs");
-    let production: String = strip_cfg_test_items(source)
+/// Every function in `source` that builds an `AdmittedTx`, paired with whether
+/// it admits the transaction it wraps. The scan deliberately does not strip
+/// `#[cfg(test)]` items: a test-only forge would let crate tests run follow-ups
+/// on an unadmitted transaction, so it must admit like any other constructor.
+fn admitted_tx_constructors(source: &str) -> Vec<(String, bool)> {
+    let production: String = source
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
         // `impl … for AdmittedTx {` headers open a block, not a value.
         .filter(|line| !line.trim_start().starts_with("impl"))
         .map(|line| format!("{line}\n"))
         .collect();
-    let constructors: Vec<&str> = function_slices(&production)
+    function_slices(&production)
         .into_iter()
         .filter(|function| function.contains("Self {") || function.contains("AdmittedTx {"))
-        .collect();
+        .map(|function| {
+            let admits = function.contains(".guard_transaction(&mut tx, community)")
+                || function.contains(".guard_transaction_with_serving_lease(&mut tx, lease)");
+            (function.to_string(), admits)
+        })
+        .collect()
+}
+
+#[test]
+fn admitted_tx_is_constructed_only_by_admitting_constructors() {
+    // The fields are private to `runtime/admitted_tx.rs`, so only that file can
+    // build the value. Pin that each function there that builds it also admits
+    // the transaction it wraps, so a new unguarded constructor cannot slip in.
+    let constructors = admitted_tx_constructors(include_str!("../src/runtime/admitted_tx.rs"));
     assert_eq!(
         constructors.len(),
         2,
         "AdmittedTx must have exactly the two admitting constructors"
     );
-    for constructor in constructors {
+    for (constructor, admits) in constructors {
         assert!(
-            constructor.contains(".guard_transaction(&mut tx, community)")
-                || constructor.contains(".guard_transaction_with_serving_lease(&mut tx, lease)"),
+            admits,
             "AdmittedTx constructor must admit the transaction it wraps: {constructor}"
         );
     }
 }
 
-/// Remove each top-level `#[cfg(test)]` item and keep the production code
-/// around it. Truncating at the first `#[cfg(test)]` would hide production
-/// functions that follow a test-only item. Tracks brace depth: the item ends
-/// on the first line that leaves depth at or below zero and ends with `;` or
-/// `}`, ignoring a trailing `//` comment. A column-0 `}` line (rustfmt's
-/// top-level close) always ends it. Braces inside string or char literals are
-/// still counted, so a test-only item with unbalanced literal braces (for
-/// example `"{"`) runs on to the next column-0 `}`; no such item exists today.
-fn strip_cfg_test_items(source: &str) -> String {
-    let mut kept = String::with_capacity(source.len());
-    let mut lines = source.lines();
-    while let Some(line) = lines.next() {
-        if line != "#[cfg(test)]" {
-            kept.push_str(line);
-            kept.push('\n');
-            continue;
-        }
-        let mut depth = 0_isize;
-        for line in lines.by_ref().skip_while(|line| line.starts_with("#[")) {
-            depth += line.matches('{').count() as isize - line.matches('}').count() as isize;
-            // Any `//` may start the trailing comment (an earlier one can sit
-            // inside a string such as `"https://…"`), so try every prefix. A
-            // false match inside a string only ends the item early, which
-            // scans more lines and can never hide production code.
-            let item_end = depth <= 0
-                && line
-                    .match_indices("//")
-                    .map(|(at, _)| &line[..at])
-                    .chain([line])
-                    .any(|text| {
-                        let text = text.trim_end();
-                        text.ends_with(';') || text.ends_with('}')
-                    });
-            if item_end || line == "}" || line == "};" {
-                break;
-            }
-        }
+#[test]
+fn admitted_tx_constructor_scan_reports_test_only_forges() {
+    let source = r#"
+impl AdmittedTx {
+    pub(crate) async fn admit(mut tx: Tx, community: CommunityId) -> Result<Self> {
+        guard.guard_transaction(&mut tx, community).await?;
+        Ok(Self { tx, community })
     }
-    kept
+
+    #[cfg(test)]
+    pub(crate) fn forge_for_tests(tx: Tx, community: CommunityId) -> Self {
+        Self { tx, community }
+    }
+}
+"#;
+    let unadmitted: Vec<String> = admitted_tx_constructors(source)
+        .into_iter()
+        .filter(|(_, admits)| !admits)
+        .map(|(function, _)| {
+            function
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        unadmitted,
+        ["pub(crate) fn forge_for_tests(tx: Tx, community: CommunityId) -> Self {"],
+        "an indented `#[cfg(test)]` forge must still be reported as unadmitted"
+    );
 }
 
 #[test]
@@ -1403,5 +1385,783 @@ fn serving_table_writes_expose_syntactic_chokepoint_or_guarded_tx_routes() {
     assert!(
         checked_guarded_files > 0,
         "guarded-table scan must exercise at least one file that writes a fenced table"
+    );
+}
+
+// Rolled-back verification probes write `events` rows that never commit, so
+// they owe no push job or TTL refresh.
+const EVENT_INSERT_FOLLOW_UP_EXCEPTIONS: [&str; 2] = [
+    "pub async fn verify_floor_guard_behavior(",
+    "pub async fn verify_channel_roster_fence_behavior(",
+];
+
+/// `source` with every `#[cfg(test)]` item removed, wherever it sits in the
+/// file. Each item runs to the `;` that ends it or to the brace that closes
+/// its body. Braces inside comments and literals are not counted (see
+/// [`mask_comments_and_literals`]). Unlike cutting the file at the first
+/// `#[cfg(test)]`, this keeps production code that follows a test-only item.
+/// The whole file is masked once and the marker is found in that view, so a
+/// mention in a comment or string (even a multiline one) strips nothing. The
+/// marker also counts only when it is the first code on its line.
+fn strip_cfg_test_items(source: &str) -> String {
+    const MARKER: &str = "#[cfg(test)]";
+    let masked = mask_comments_and_literals(source);
+    let mut kept = String::with_capacity(source.len());
+    let mut copied = 0usize;
+    let mut search = 0usize;
+    while let Some(found) = masked[search..].find(MARKER) {
+        let at = search + found;
+        let line_start = masked[..at].rfind('\n').map_or(0, |newline| newline + 1);
+        search = at + MARKER.len();
+        if !masked[line_start..at].trim().is_empty() {
+            continue;
+        }
+        kept.push_str(&source[copied..at]);
+        copied = search + cfg_test_item_len(&masked[search..]);
+        search = copied;
+    }
+    kept.push_str(&source[copied..]);
+    kept
+}
+
+/// Length of the item that starts `masked_item`, which must already be masked
+/// so braces in comments and literals are not counted.
+fn cfg_test_item_len(masked_item: &str) -> usize {
+    let mut depth = 0usize;
+    for (index, byte) in masked_item.bytes().enumerate() {
+        match byte {
+            b';' if depth == 0 => return index + 1,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return index + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    masked_item.len()
+}
+
+/// Whether the `r` at `index` begins a raw literal token: `r"`, or the `br"` /
+/// `cr"` raw byte and C strings, rather than ending an identifier such as `for"`.
+fn raw_literal_prefix_starts_token(bytes: &[u8], index: usize) -> bool {
+    let is_ident = |at: Option<usize>| {
+        at.and_then(|at| bytes.get(at))
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    };
+    let before = index.checked_sub(1);
+    !is_ident(before)
+        || (matches!(before.map(|at| bytes[at]), Some(b'b' | b'c'))
+            && !is_ident(index.checked_sub(2)))
+}
+
+/// `source` with every comment (`//`, `///`, nested `/* */`) and every string,
+/// raw string, and char literal replaced by spaces, byte for byte. Newlines are
+/// kept, so offsets and line structure match `source`. Scans that look for
+/// code (braces, calls) read the masked text; scans that look for SQL read
+/// the original, because the SQL lives inside string literals.
+fn mask_comments_and_literals(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut blank = |from: usize, to: usize| {
+        for byte in &mut masked[from..to.min(bytes.len())] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    };
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let start = index;
+        match bytes[index] {
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let mut depth = 0usize;
+                while index < bytes.len() {
+                    if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                        depth += 1;
+                        index += 2;
+                    } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                        depth -= 1;
+                        index += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'r' if matches!(bytes.get(index + 1), Some(b'"' | b'#'))
+                && raw_literal_prefix_starts_token(bytes, index)
+                && bytes.get(
+                    index
+                        + 1
+                        + bytes[index + 1..]
+                            .iter()
+                            .take_while(|byte| **byte == b'#')
+                            .count(),
+                ) == Some(&b'"') =>
+            {
+                let hashes = bytes[index + 1..]
+                    .iter()
+                    .take_while(|byte| **byte == b'#')
+                    .count();
+                let close = format!("\"{}", "#".repeat(hashes));
+                let body = index + 2 + hashes;
+                index = source[body..]
+                    .find(&close)
+                    .map_or(bytes.len(), |offset| body + offset + close.len());
+            }
+            b'"' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != b'"' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index += 1;
+            }
+            b'\'' if char_literal_end(source, index).is_some() => {
+                index = char_literal_end(source, index).expect("guard matched");
+            }
+            _ => {
+                index += 1;
+                continue;
+            }
+        }
+        blank(start, index);
+    }
+    String::from_utf8(masked).expect("masking replaces whole ASCII-delimited spans")
+}
+
+/// The end (exclusive) of the char literal whose opening quote is at `start`,
+/// such as `'{'`, `'é'`, `'\''`, `'\x7f'`, or `'\u{1F600}'`. `None` for a
+/// lifetime, which has no closing quote.
+fn char_literal_end(source: &str, start: usize) -> Option<usize> {
+    // `start` holds an ASCII quote, so `start + 1` is a char boundary.
+    let rest = &source[start + 1..];
+    let body = if let Some(escape) = rest.strip_prefix('\\') {
+        // The longest escape is `\u{10FFFF}`: a backslash and 9 more bytes.
+        // Skip the escaped byte so `'\''` does not close on its own quote.
+        let close = escape.get(1..)?.find('\'')? + 1;
+        (close <= 9).then_some(1 + close)?
+    } else {
+        rest.chars().next()?.len_utf8()
+    };
+    rest[body..]
+        .starts_with('\'')
+        .then_some(start + 1 + body + 1)
+}
+
+#[test]
+fn masker_blanks_every_literal_form_and_keeps_code() {
+    for (input, expected) in [
+        // Raw strings with zero, one, or several `#`, and the `b`/`c` raw
+        // prefixes. Each body ends in `\`, which would escape the closing quote
+        // if the literal were scanned as a plain string.
+        (r#"a(r"\") {}"#, "a(    ) {}"),
+        (r###"a(r##"x"#{"##) {}"###, "a(           ) {}"),
+        (r##"a(br#"\"#) {}"##, "a(b      ) {}"),
+        (r#"a(br"\") {}"#, "a(b    ) {}"),
+        (r#"a(cr"\") {}"#, "a(c    ) {}"),
+        // Plain byte and C strings.
+        (r#"a(b"{") {}"#, "a(b   ) {}"),
+        (r#"a(c"{") {}"#, "a(c   ) {}"),
+        // Plain and escaped char literals.
+        (
+            r"a('\'', '\\', '\n', '{') {}",
+            "a(    ,     ,     ,    ) {}",
+        ),
+        // Multi-byte and long-escape char literals. Each holds a brace, or
+        // hides one from a scan that misreads the literal's length.
+        ("a('é', '{') {}", "a(    ,    ) {}"),
+        (r"a('\u{1F600}', '{') {}", "a(           ,    ) {}"),
+        (r"a('\x7f', '{') {}", "a(      ,    ) {}"),
+        // Code that only looks like a literal stays as it is.
+        ("let r#type = 1; {}", "let r#type = 1; {}"),
+        ("fn f<'a>(x: &'a str) {}", "fn f<'a>(x: &'a str) {}"),
+    ] {
+        assert_eq!(
+            mask_comments_and_literals(input),
+            expected,
+            "masking `{input}`"
+        );
+    }
+}
+
+/// Whether `source` inserts into `events` itself (not `event_mentions` or any
+/// other `events_*` table), in any letter case, across line breaks and string
+/// continuations, `\n`/`\t`/`\r` escapes, and with or without a `public.`
+/// schema prefix.
+fn inserts_events_row(source: &str) -> bool {
+    !events_insert_tails(source).is_empty()
+}
+
+/// `source` lowercased, with every run of whitespace, `\` line continuations,
+/// and `\n`/`\t`/`\r` escapes collapsed to one space.
+fn normalized_sql(source: &str) -> String {
+    let mut normalized = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() || ch == '\\' {
+            if ch == '\\' && matches!(chars.peek(), Some('n' | 't' | 'r')) {
+                chars.next();
+            }
+            if !normalized.ends_with(' ') {
+                normalized.push(' ');
+            }
+        } else {
+            normalized.push(ch.to_ascii_lowercase());
+        }
+    }
+    normalized
+}
+
+/// The normalized SQL that follows each `INSERT INTO events` in `source`.
+fn events_insert_tails(source: &str) -> Vec<String> {
+    let normalized = normalized_sql(source);
+    let mut tails = Vec::new();
+    for marker in ["insert into events", "insert into public.events"] {
+        for (index, marker) in normalized.match_indices(marker) {
+            let tail = &normalized[index + marker.len()..];
+            if tail
+                .chars()
+                .next()
+                .is_none_or(|next| !(next.is_ascii_alphanumeric() || next == '_'))
+            {
+                tails.push(tail.to_owned());
+            }
+        }
+    }
+    tails
+}
+
+/// An events insert must run both follow-ups: the push enqueue and the
+/// pre-commit TTL refresh. `after_admitted_insert` does both; a writer that
+/// inserts inside a savepoint calls the two halves separately.
+///
+/// Only real calls count: a hook in a comment or a string literal does not.
+fn runs_event_follow_ups(function_source: &str) -> bool {
+    let code = mask_comments_and_literals(function_source);
+    code.contains("event_follow_up::after_admitted_insert(")
+        || (code.contains("event_follow_up::enqueue_push_match(")
+            && code.contains(".record_channel_event("))
+}
+
+fn event_insert_follow_up_violations(production_source: &str) -> Vec<String> {
+    function_slices(production_source)
+        .into_iter()
+        .filter(|function_source| {
+            let header = function_header(function_source);
+            inserts_events_row(function_source)
+                && !EVENT_INSERT_FOLLOW_UP_EXCEPTIONS
+                    .iter()
+                    .any(|exception| header.starts_with(exception))
+                && !runs_event_follow_ups(function_source)
+        })
+        .map(|function_source| function_header(function_source).to_owned())
+        .collect()
+}
+
+#[test]
+fn event_insert_follow_up_policy_rejects_writers_without_the_hook() {
+    let source = r##"
+pub(crate) async fn unhooked_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+}
+pub(crate) async fn push_only_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events \
+                 (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+    crate::store::event_follow_up::enqueue_push_match(tx.conn(), community, id, kind)
+        .await
+        .expect("enqueue");
+}
+pub(crate) async fn hooked_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+    crate::store::event_follow_up::after_admitted_insert(tx, id, kind, channel)
+        .await
+        .expect("follow up");
+}
+pub(crate) async fn savepoint_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+    crate::store::event_follow_up::enqueue_push_match(tx.conn(), community, id, kind)
+        .await
+        .expect("enqueue");
+    tx.record_channel_event(channel, kind);
+}
+pub(crate) async fn mention_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO event_mentions (community_id, event_id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+}
+pub async fn verify_floor_guard_behavior(pool: &PgPool) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(pool)
+        .await
+        .expect("probe");
+}
+pub(crate) async fn lowercase_writer(tx: &mut AdmittedTx) {
+    sqlx::query("insert into
+        public.events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+}
+pub(crate) async fn continued_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO \
+                 events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+}
+/// Kept at module scope, not `#[cfg(test)]`, because production calls it.
+pub(crate) async fn writer_under_doc_mention(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+}
+// see `#[cfg(test)] mod x {`
+pub(crate) async fn writer_under_brace_mention(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+}
+pub(crate) async fn writer_with_escaped_newline(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO\nevents (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+}
+pub(crate) async fn writer_with_commented_out_hook(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+    // crate::store::event_follow_up::after_admitted_insert(tx, id, kind, channel)
+}
+pub(crate) async fn writer_with_block_commented_hook(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+    /* crate::store::event_follow_up::enqueue_push_match(tx.conn(), community, id, kind)
+       /* nested */ tx.record_channel_event(channel, kind); */
+}
+pub(crate) async fn writer_with_hook_in_string(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+    tracing::debug!("skipped event_follow_up::after_admitted_insert(tx, ..)");
+}
+pub(crate) async fn writer_with_nested_block_commented_hook(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+    /* /* inner */ crate::store::event_follow_up::after_admitted_insert(tx, id, kind, channel) */
+}
+pub(crate) async fn writer_with_hook_after_escaped_quote(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+    tracing::debug!("\"event_follow_up::after_admitted_insert(\"");
+}
+pub(crate) async fn writer_with_hook_in_raw_string(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+    tracing::debug!(r#""event_follow_up::after_admitted_insert(""#);
+}
+/*
+#[cfg(test)]
+*/
+pub(crate) async fn writer_after_block_commented_cfg_test(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+}
+pub(crate) async fn writer_after_raw_string_example(tx: &mut AdmittedTx) {
+    let _example = r#"
+fn example() {
+    crate::store::event_follow_up::after_admitted_insert(tx, id, kind, channel)
+}
+"#;
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+}
+#[cfg(test)]
+fn test_only_helper() -> (&'static str, char, &'static str, char, &'static [u8]) {
+    // an unbalanced { in a comment
+    ("{", '{', r#"}"} {"#, '"', br#"\"#)
+}
+pub(crate) async fn writer_after_test_helper(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+        .execute(tx.conn())
+        .await
+        .expect("write");
+}
+#[cfg(test)]
+mod tests {
+    async fn test_writer(pool: &PgPool) {
+        sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)")
+            .execute(pool)
+            .await
+            .expect("fixture");
+    }
+}
+"##;
+
+    assert_eq!(
+        event_insert_follow_up_violations(&strip_cfg_test_items(source)),
+        [
+            "pub(crate) async fn unhooked_writer(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn push_only_writer(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn lowercase_writer(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn continued_writer(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_under_doc_mention(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_under_brace_mention(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_with_escaped_newline(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_with_commented_out_hook(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_with_block_commented_hook(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_with_hook_in_string(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_with_nested_block_commented_hook(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_with_hook_after_escaped_quote(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_with_hook_in_raw_string(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_after_block_commented_cfg_test(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_after_raw_string_example(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_after_test_helper(tx: &mut AdmittedTx) {",
+        ],
+        "an events insert must run the push enqueue and record the TTL refresh"
+    );
+}
+
+fn production_event_writer_source_files() -> Vec<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read source directory") {
+            let path = entry.expect("read directory entry").path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if should_scan_guarded_write_source_file(&path) {
+                out.push(path);
+            }
+        }
+    }
+
+    let crates_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate lives under crates/");
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(crates_root).expect("read crates directory") {
+        let src = entry.expect("read crates entry").path().join("src");
+        if src.is_dir() {
+            collect_rs_files(&src, &mut files);
+        }
+    }
+
+    files
+}
+
+#[test]
+fn every_production_event_insert_runs_the_follow_up_hook() {
+    let files = production_event_writer_source_files();
+    let mut hooked_writers = 0usize;
+    let mut violations = Vec::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("read source file");
+        let production = strip_cfg_test_items(&source);
+        if !inserts_events_row(&production) {
+            continue;
+        }
+        for function_source in function_slices(&production) {
+            if inserts_events_row(function_source) && runs_event_follow_ups(function_source) {
+                hooked_writers += 1;
+            }
+        }
+        violations.extend(
+            event_insert_follow_up_violations(&production)
+                .into_iter()
+                .map(|header| format!("{}: {header}", path.display())),
+        );
+    }
+
+    assert!(
+        violations.is_empty(),
+        "production `INSERT INTO events` writers must call `event_follow_up` because no \
+         trigger does the push enqueue or channel TTL refresh: {violations:?}"
+    );
+    // The seven writers at the time of BUZZ-176. A lower count means the scan
+    // stopped seeing a writer, not that one was removed safely.
+    assert!(
+        hooked_writers >= 7,
+        "expected at least seven hooked event writers, found {hooked_writers}"
+    );
+}
+
+// Fixed channel-less kinds cannot be channel rosters. The startup probes must
+// exercise the retained DB backstops directly and roll back all their writes.
+// Exemptions match by function header, so a kind 39002 insert added inside one
+// of these functions would pass the policy; keep them single-purpose.
+const EVENT_INSERT_ROSTER_GUARD_EXCEPTIONS: [&str; 4] = [
+    // NIP-43 membership is kind 13534 with channel_id NULL.
+    "pub(crate) async fn write_nip43_membership_snapshot(",
+    // Push leases are kind 30350 with channel_id NULL.
+    "pub async fn accept_lease_event(",
+    // Rolled-back replica-floor startup probe.
+    "pub async fn verify_floor_guard_behavior(",
+    // Rolled-back roster-fence startup probe.
+    "pub async fn verify_channel_roster_fence_behavior(",
+];
+
+fn event_insert_roster_guard_violations(production_source: &str) -> Vec<String> {
+    function_slices(production_source)
+        .into_iter()
+        .filter(|function_source| {
+            let header = function_header(function_source);
+            let code = mask_comments_and_literals(function_source);
+            inserts_events_row(function_source)
+                && !EVENT_INSERT_ROSTER_GUARD_EXCEPTIONS
+                    .iter()
+                    .any(|exception| header.starts_with(exception))
+                && !code.contains("guard_channel_roster_event(")
+                && !code.contains("validate_channel_roster_snapshot(")
+        })
+        .map(|function_source| function_header(function_source).to_owned())
+        .collect()
+}
+
+#[test]
+fn event_insert_roster_guard_policy_rejects_writers_without_the_guard() {
+    let source = r#"
+pub(crate) async fn unguarded_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub(crate) async fn guarded_writer(tx: &mut AdmittedTx) {
+    guard_channel_roster_event(tx, kind, channel, tags).await?;
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub(crate) async fn locked_writer(tx: &mut AdmittedTx) {
+    validate_channel_roster_snapshot(tx, channel, tags).await?;
+    sqlx::query("insert into public.events (community_id, id) VALUES ($1, $2)");
+}
+pub(crate) async fn mention_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO event_mentions (community_id, event_id) VALUES ($1, $2)");
+}
+pub(crate) async fn commented_guard_writer(tx: &mut AdmittedTx) {
+    // guard_channel_roster_event(tx, kind, channel, tags).await?;
+    /* validate_channel_roster_snapshot(tx, channel, tags).await?; */
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub(crate) async fn quoted_guard_writer(tx: &mut AdmittedTx) {
+    tracing::debug!("guard_channel_roster_event(");
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub(crate) async fn write_nip43_membership_snapshot(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub async fn accept_lease_event(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub async fn verify_floor_guard_behavior(pool: &PgPool) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub async fn verify_channel_roster_fence_behavior(pool: &PgPool) {
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+    }
+}
+"#;
+    assert_eq!(
+        event_insert_roster_guard_violations(&strip_cfg_test_items(source)),
+        [
+            "pub(crate) async fn unguarded_writer(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn commented_guard_writer(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn quoted_guard_writer(tx: &mut AdmittedTx) {",
+        ],
+        "only real roster-guard calls in production writers count"
+    );
+}
+
+/// Presence check: every production `INSERT INTO events` function must contain
+/// a real (uncommented, unquoted) roster-guard call. It does not prove the call
+/// is awaited, reachable, or given the event's real kind and channel; the PG
+/// `app_roster_guard_*` tests cover behavior.
+#[test]
+fn every_production_event_insert_runs_the_roster_guard() {
+    let mut checked_writers = 0;
+    let mut violations = Vec::new();
+    for path in production_event_writer_source_files() {
+        let source = std::fs::read_to_string(&path).expect("read source file");
+        let production = strip_cfg_test_items(&source);
+        checked_writers += function_slices(&production)
+            .into_iter()
+            .filter(|function| inserts_events_row(function))
+            .count();
+        violations.extend(
+            event_insert_roster_guard_violations(&production)
+                .into_iter()
+                .map(|header| format!("{}: {header}", path.display())),
+        );
+    }
+    assert!(
+        violations.is_empty(),
+        "production `INSERT INTO events` writers must run the app-side roster guard: {violations:?}"
+    );
+    // Five guarded writers plus the four explicitly exempt writers/probes.
+    assert!(
+        checked_writers >= 9,
+        "expected at least nine event writers, found {checked_writers}"
+    );
+}
+
+// The rolled-back replica-floor probe writes a kind 9 row, which has no `d`.
+const EVENT_INSERT_D_TAG_EXCEPTIONS: [&str; 1] = ["pub async fn verify_floor_guard_behavior("];
+
+/// Whether an `INSERT INTO events` tail names `d_tag` in an explicit column
+/// list. An insert without a column list does not count.
+fn events_insert_names_d_tag(tail: &str) -> bool {
+    tail.trim_start()
+        .strip_prefix('(')
+        .and_then(|columns| columns.split_once(')'))
+        .is_some_and(|(columns, _)| columns.split(',').any(|column| column.trim() == "d_tag"))
+}
+
+fn event_insert_d_tag_violations(production_source: &str) -> Vec<String> {
+    function_slices(production_source)
+        .into_iter()
+        .filter(|function_source| {
+            let header = function_header(function_source);
+            !EVENT_INSERT_D_TAG_EXCEPTIONS
+                .iter()
+                .any(|exception| header.starts_with(exception))
+                && !events_insert_tails(function_source)
+                    .iter()
+                    .all(|tail| events_insert_names_d_tag(tail))
+        })
+        .map(|function_source| function_header(function_source).to_owned())
+        .collect()
+}
+
+#[test]
+fn event_insert_d_tag_policy_rejects_writers_without_the_column() {
+    let source = r##"
+pub(crate) async fn writer_without_d_tag(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id, kind) VALUES ($1, $2, $3)");
+}
+pub(crate) async fn writer_with_d_tag(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events \
+                 (community_id, id, kind, d_tag) VALUES ($1, $2, $3, $4)");
+}
+pub(crate) async fn writer_with_compact_columns(tx: &mut AdmittedTx) {
+    sqlx::query("insert into public.events (community_id,id,kind,d_tag) VALUES ($1,$2,$3,$4)");
+}
+pub(crate) async fn writer_with_d_tag_only_in_values(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id, kind) SELECT community_id, id, d_tag FROM x");
+}
+pub(crate) async fn writer_with_lookalike_column(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id, kind, d_tag_hash) VALUES ($1, $2, $3, $4)");
+}
+pub(crate) async fn writer_without_column_list(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events SELECT * FROM staged_events");
+}
+pub(crate) async fn second_insert_without_d_tag(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO events (community_id, id, d_tag) VALUES ($1, $2, $3)");
+    sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+}
+pub(crate) async fn mention_writer(tx: &mut AdmittedTx) {
+    sqlx::query("INSERT INTO event_mentions (community_id, event_id) VALUES ($1, $2)");
+}
+pub async fn verify_floor_guard_behavior(pool: &PgPool) {
+    sqlx::query("INSERT INTO events (community_id, id, kind) VALUES ($1, $2, 9)");
+}
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        sqlx::query("INSERT INTO events (community_id, id) VALUES ($1, $2)");
+    }
+}
+"##;
+    assert_eq!(
+        event_insert_d_tag_violations(&strip_cfg_test_items(source)),
+        [
+            "pub(crate) async fn writer_without_d_tag(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_with_d_tag_only_in_values(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_with_lookalike_column(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn writer_without_column_list(tx: &mut AdmittedTx) {",
+            "pub(crate) async fn second_insert_without_d_tag(tx: &mut AdmittedTx) {",
+        ],
+        "every production events insert must name `d_tag` in its column list"
+    );
+}
+
+/// Addressable events (kinds 30000-39999) replace by `d_tag`, and the only
+/// index that serves that lookup is partial on `d_tag IS NOT NULL`. A writer
+/// that leaves the column out stores NULL, so its rows never replace. Nothing
+/// repairs them after the fact, so every production writer must name the column.
+///
+/// This is a text match, not a proof. It checks the column list of literal
+/// `INSERT INTO [public.]events (...)` SQL inside function bodies under each
+/// crate's `src/`. It does not see `ONLY`, quoted or `format!`-built table
+/// names, a comment between the keywords, or SQL held in a constant outside a
+/// function, and it does not check that the bound value is non-NULL. Exempt
+/// probes are skipped by function header, so every insert inside them is too.
+#[test]
+fn every_production_event_insert_names_d_tag() {
+    let mut checked_writers = 0;
+    let mut violations = Vec::new();
+    for path in production_event_writer_source_files() {
+        let source = std::fs::read_to_string(&path).expect("read source file");
+        let production = strip_cfg_test_items(&source);
+        checked_writers += function_slices(&production)
+            .into_iter()
+            .filter(|function| inserts_events_row(function))
+            .count();
+        violations.extend(
+            event_insert_d_tag_violations(&production)
+                .into_iter()
+                .map(|header| format!("{}: {header}", path.display())),
+        );
+    }
+    assert!(
+        violations.is_empty(),
+        "production `INSERT INTO events` writers must name `d_tag` in their column list: \
+         {violations:?}"
+    );
+    // The same writer set as the roster-guard scan. A lower count means the
+    // scan stopped seeing a writer, not that one was removed safely.
+    assert!(
+        checked_writers >= 9,
+        "expected at least nine event writers, found {checked_writers}"
     );
 }

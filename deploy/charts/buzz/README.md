@@ -173,8 +173,8 @@ two gauges labelled `phase`:
 - `buzz_startup_phase_seconds` is the finished step's duration.
 
 `degraded` means the step hit a non-fatal error and startup continued — for
-example, some communities failed NIP-43 reconciliation or a NIP-FI issuer did
-not warm. `failed` means startup aborted inside the step.
+example, some large channel rosters failed reconciliation or a NIP-FI issuer
+did not warm. `failed` means startup aborted inside the step.
 
 These are gauges, not counters, because each value is written once per boot
 and a monotonic-counter scrape drops a series' first sample. Each is written
@@ -183,8 +183,7 @@ field of the `Prometheus metrics exporter started` log (2700 s with default
 intervals). A step that runs longer than that timeout loses its `_current`
 series, so a pod stuck that long shows no current step. The `phase` values are
 the closed `StartupStep` vocabulary in `crates/buzz-relay/src/startup_steps.rs`;
-they never reuse an early lifecycle phase name. The NIP-43 startup reconcile
-also logs `NIP-43 startup reconciliation progress` every 5,000 communities.
+they never reuse an early lifecycle phase name.
 
 ### Readiness contract
 
@@ -195,6 +194,15 @@ gating the probe on them removed the whole deployment from the load balancer at
 once and left a reconnect burst with nowhere to land. There is no separate
 "starting" state — the health listener does not bind until the database,
 migrations, Redis, and pub/sub are up, so a process that can answer has booted.
+With `BUZZ_NIP_FI_COMMUNITY_SOURCE=database` and a mode other than `off`, the
+first NIP-FI binding snapshot also loads before any listener binds (startup
+phase `nip_fi_snapshot_load`); a failed load exits the process, so a pod never
+reports ready without one. Later refresh failures do not affect readiness —
+watch `buzz_nip_fi_binding_snapshot_loaded_timestamp_seconds` instead. The
+source's env vars (`BUZZ_NIP_FI_COMMUNITY_SOURCE`,
+`BUZZ_NIP_FI_SNAPSHOT_MAX_ROWS`, `BUZZ_NIP_FI_SNAPSHOT_REFRESH_TIMEOUT_MS`,
+`BUZZ_NIP_FI_RESOLVER_NEGATIVE_CACHE_MAX`, `BUZZ_NIP_FI_RESOLVER_MAX_INFLIGHT`)
+and alerts are in `docs/operator-nip-fi-bindings.md`.
 
 Shared-dependency health moved to **`/_status`** on the same private health
 listener, under a `dependencies` object carrying the `postgres`, `redis`,
@@ -459,6 +467,85 @@ collide with chart-owned containers or volumes, mounts must reference existing
 volumes, and each init container must define an appropriate security context
 and resources. Empty `relay.command` and `relay.args` arrays preserve the image
 defaults; non-empty values override its entrypoint and arguments respectively.
+
+## Storage accounting worker
+
+`storageAccounting.enabled=true` adds a CronJob that runs
+`buzz-admin storage-snapshot` against the relay's S3 bucket and writes a
+durable snapshot row, keeping the expensive object walk off the relay Pods.
+
+### Snapshot identity contract
+
+Every snapshot row records the code that produced it in `code_sha`, taken from
+the `BUZZ_STORAGE_SNAPSHOT_CODE_SHA` environment variable the chart derives
+from the deployed image identity (`image.digest` when set, otherwise
+`image.tag`, otherwise `Chart.AppVersion`). The value is never hashed or
+sanitized.
+
+## Datadog version label
+
+Every Pod the chart renders — relay, pairing relay, storage accounting, and the
+deletion drain operator job — carries a chart-owned
+`tags.datadoghq.com/version` label derived from the deployed image:
+`image.tag` when set, otherwise `image.digest`, otherwise `Chart.AppVersion`.
+The tag is preferred because it is the readable build name (`sha-<sha7>`, or
+`main-<UTC commit time>-<sha7>` for Kargo-promoted main builds) dashboards use; promotion tooling writes it together with the digest
+that actually pins the image.
+
+```yaml
+relay:
+  podLabels:
+    tags.datadoghq.com/env: production
+    tags.datadoghq.com/service: buzz
+    # tags.datadoghq.com/version: NOT set here — the chart owns it.
+```
+
+Precedence is explicit: a `tags.datadoghq.com/version` supplied under any
+workload's `podLabels` is ignored. Every other label — including
+`tags.datadoghq.com/env` and `tags.datadoghq.com/service`, which describe the
+deployment rather than the image — passes through unchanged. Remove any
+wrapper-maintained version pins when upgrading; a pin equal to `image.tag`
+renders identically, so the upgrade does not roll Pods for that label.
+
+A Kubernetes label value is capped at 63 bytes, must begin and end with an
+alphanumeric, and may otherwise contain only `[-._a-zA-Z0-9]` — a far narrower
+grammar than an OCI tag. `image.tag` is deliberately left unconstrained, so the
+label is derived through a total mapping rather than a check that could reject
+a tag the chart used to accept:
+
+| Revision | Label |
+|---|---|
+| `sha256:<64 hex>` digest | the hex without `sha256:`, first 63 characters |
+| already a valid label value, lowercase, no `__`, and not exactly 63 lowercase hex characters | emitted byte for byte (e.g. `1.2.3-rc.4`, `sha-1a2b3c4`) |
+| anything else | the first 63 hex characters of the revision's SHA-256 |
+
+The passthrough row requires Datadog's normal form because Datadog lowercases
+tag values and collapses `__`: passing `ReleaseA` and `releasea` through
+unchanged would report one version for two revisions. Every emitted label is
+therefore already normalized, so distinct labels stay distinct in Datadog.
+
+When both `image.tag` and `image.digest` are set, the label names the tag —
+even if the tag and digest disagree. The digest still pins what actually runs
+(`repository@digest`), so keep the two in step when promoting.
+
+Exactly 63 lowercase hex characters is a **reserved shape** — it is what the
+first and third rows emit, so the passthrough row must not be able to emit it
+too. A tag of that shape is hashed rather than preserved. Shorter hex tags and
+ordinary 40-character git SHAs are unaffected.
+
+Arbitrary OCI revisions outnumber 63-byte label values, so **no mapping onto
+this grammar can be injective** and the chart does not claim one. What it does
+claim is collision *resistance*: every case retains 252 bits of SHA-256, the
+same margin the digest case has always relied on, and the reserved shape keeps
+that margin across cases rather than only within one. Two earlier iterations
+fell short of this — one kept a readable prefix with only 40 bits of hash (a
+colliding tag pair was brute-forced in about a second), and one let a
+passthrough tag reproduce a hashed label with no hash work at all, by copying a
+rendered label into `image.tag`.
+
+The image reference in the Pod spec and `BUZZ_STORAGE_SNAPSHOT_CODE_SHA` always
+keep the exact revision; the label is the joinable telemetry key. See
+`docs/deployment-identity.md`.
 
 ## Device pairing relay
 

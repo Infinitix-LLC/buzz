@@ -186,6 +186,10 @@ async fn reject_legacy_nip_rs_cardinality_ambiguity(conn: &mut PgConnection) -> 
 }
 
 #[cfg(test)]
+#[path = "follow_up_retirement_tests.rs"]
+mod retirement_postgres_tests;
+
+#[cfg(test)]
 mod postgres_tests {
     use super::*;
     use std::{
@@ -230,6 +234,66 @@ mod postgres_tests {
             .map(|(_, pass)| pass.to_owned())
             .or_else(|| std::env::var("PGPASSWORD").ok())
             .unwrap_or_default()
+    }
+
+    /// Runs `bin/pgschema <command>` against `db`, which doubles as the plan
+    /// database (`--plan-*`): that avoids the embedded-Postgres download and
+    /// matches start-relay-for-tests.sh. Runs from the repository root, like
+    /// every pgschema caller, so `.pgschemaignore` applies.
+    fn pgschema(conn: &PgConn, db: &str, command: &[&str]) -> std::process::Output {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let port = conn.port.to_string();
+        std::process::Command::new(repo_root.join("bin/pgschema"))
+            .current_dir(&repo_root)
+            .args(command)
+            .args([
+                "--file",
+                "schema/schema.sql",
+                "--host",
+                &conn.host,
+                "--port",
+                &port,
+                "--user",
+                &conn.user,
+                "--password",
+                &conn.password,
+                "--db",
+                db,
+                "--plan-host",
+                &conn.host,
+                "--plan-port",
+                &port,
+                "--plan-user",
+                &conn.user,
+                "--plan-password",
+                &conn.password,
+                "--plan-db",
+                db,
+            ])
+            .output()
+            .expect("run bin/pgschema (hermit env required)")
+    }
+
+    /// Dated monthlies `schema/partitions/` declares, e.g. `events_p2026_01`.
+    fn declared_monthlies() -> BTreeSet<String> {
+        let dir = crate::test_support::desired_state_schema_dir().join("partitions");
+        let mut names = BTreeSet::new();
+        for entry in fs::read_dir(&dir).expect("read schema/partitions") {
+            let sql = fs::read_to_string(entry.expect("partition file").path())
+                .expect("read partition file");
+            names.extend(
+                sql.lines()
+                    .filter_map(|line| line.strip_prefix("CREATE TABLE "))
+                    .filter_map(|rest| rest.split_whitespace().next())
+                    .filter(|name| {
+                        name.rsplit_once("_p").is_some_and(|(_, month)| {
+                            month.starts_with(|c: char| c.is_ascii_digit())
+                        })
+                    })
+                    .map(str::to_owned),
+            );
+        }
+        names
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -705,7 +769,43 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 57);
+        assert_eq!(migrations.len(), 67);
+        assert_eq!(migrations[64].version, 65);
+        let retire_ttl = strip_sql_comments(migrations[64].sql.as_str());
+        for statement in [
+            "SET LOCAL lock_timeout = '5s';",
+            "DROP TRIGGER events_refresh_channel_ttl ON events;",
+            "DROP FUNCTION refresh_channel_ttl_after_event_insert();",
+        ] {
+            assert!(retire_ttl.contains(statement), "0065 must run {statement}");
+        }
+        let desired_schema = crate::test_support::desired_state_schema_sql();
+        assert!(!desired_schema.contains("events_refresh_channel_ttl"));
+        assert!(!desired_schema.contains("refresh_channel_ttl_after_event_insert"));
+        assert_eq!(migrations[58].version, 59);
+        assert!(migrations[58].sql.as_str().contains("buzz.push_enabled"));
+        assert_eq!(migrations[59].version, 60);
+        assert!(migrations[59]
+            .sql
+            .as_str()
+            .contains("ALTER TABLE push_leases DROP COLUMN app_profile"));
+        assert_eq!(migrations[60].version, 61);
+        assert!(migrations[60].sql.as_str().contains("ADD COLUMN labels"));
+        assert_eq!(migrations[61].version, 62);
+        assert!(migrations[61]
+            .sql
+            .as_str()
+            .contains("ALTER TYPE channel_type ADD VALUE IF NOT EXISTS 'system'"));
+        assert_eq!(migrations[63].version, 64);
+        assert!(migrations[63]
+            .sql
+            .as_str()
+            .contains("CREATE FUNCTION profile_name_fields"));
+        assert_eq!(migrations[65].version, 66);
+        assert!(migrations[65]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE community_nip_fi_issuers"));
         assert_eq!(migrations[55].version, 56);
         assert!(migrations[55]
             .sql
@@ -716,6 +816,16 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("ALTER TABLE personal_read_accounts ADD COLUMN started_at"));
+        assert_eq!(migrations[57].version, 58);
+        assert!(migrations[57]
+            .sql
+            .as_str()
+            .contains("ADD COLUMN through_message_id"));
+        assert_eq!(migrations[66].version, 67);
+        assert!(migrations[66]
+            .sql
+            .as_str()
+            .contains("ADD COLUMN join_role TEXT NOT NULL DEFAULT 'member'"));
         assert_eq!(migrations[48].version, 49);
         assert_eq!(migrations[49].version, 50);
         assert_eq!(migrations[50].version, 51);
@@ -1322,7 +1432,7 @@ mod postgres_tests {
         assert!(dogfood_profile
             .contains("DROP CONSTRAINT push_gateway_installations_app_profile_check"));
         assert!(dogfood_profile.contains("CHECK (app_profile = 'buzz-ios-dogfood')"));
-        assert!(desired_schema.contains("CHECK (app_profile = 'buzz-ios-dogfood')"));
+        assert!(!desired_schema.contains("app_profile"));
 
         // Drop the Phase-A NIP-FI relay-side authority ledger (0041 + 0042).
         // OSS Buzz is stateless for identity (spec v2, PR #7214); the durable
@@ -1464,6 +1574,32 @@ mod postgres_tests {
         assert!(
             apply_count > 0,
             "expected at least one pgschema apply caller"
+        );
+    }
+
+    /// `.pgschemaignore` hides dated monthlies from pgschema so a re-apply
+    /// cannot drop the ones the relay created at runtime. Each monthly
+    /// `schema/partitions/` declares must be exempt, or pgschema would stop
+    /// creating it on a fresh database.
+    #[test]
+    fn pgschemaignore_exempts_exactly_the_declared_monthlies() {
+        let ignore =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.pgschemaignore"))
+                .expect("read .pgschemaignore");
+        let exempt: BTreeSet<String> = ignore
+            .lines()
+            .filter_map(|line| {
+                line.trim()
+                    .trim_end_matches(',')
+                    .strip_prefix("\"!")?
+                    .strip_suffix('"')
+            })
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            exempt,
+            declared_monthlies(),
+            ".pgschemaignore `!` exemptions must match the monthlies schema/partitions/ declares"
         );
     }
 
@@ -1655,7 +1791,8 @@ mod postgres_tests {
         assert!(!sql.contains("NEW.kind IN (7, 9, 1059, 40007, 46010)"));
 
         let desired_schema = crate::test_support::desired_state_schema_sql();
-        assert!(desired_schema.contains("NEW.kind IN (9, 40002, 45001, 45003)"));
+        assert!(!desired_schema.contains("enqueue_push_match_job"));
+        assert!(!desired_schema.contains("events_enqueue_push_match"));
         assert!(!desired_schema.contains("NEW.kind IN (7, 9, 1059, 40007, 46010)"));
     }
 
@@ -2229,6 +2366,18 @@ mod postgres_tests {
             .get("personal_read_accounts")
             .expect("schema.sql personal read accounts")
             .contains(started_at_column));
+        // 0058 replaces the frontier's whole-channel cut with its anchor ID.
+        let threads_through_column = "threads_through_timestamp timestamptz \
+            check (threads_through_timestamp is null or root_id = ''::bytea), ";
+        let through_message_column =
+            "through_message_id bytea check (octet_length(through_message_id) = 32), ";
+        let through_message = MIGRATOR
+            .iter()
+            .find(|m| m.version == 58)
+            .expect("personal read anchor migration")
+            .sql
+            .as_str();
+        assert!(through_message.contains("DROP COLUMN threads_through_timestamp"));
         for (table, definition) in personal.tables {
             let in_schema = schema.tables.get(&table).map(|schema_definition| {
                 if table == "personal_read_accounts" {
@@ -2237,6 +2386,11 @@ mod postgres_tests {
                     schema_definition.clone()
                 }
             });
+            let definition = if table == "personal_read_frontiers" {
+                definition.replacen(threads_through_column, through_message_column, 1)
+            } else {
+                definition
+            };
             assert_eq!(
                 in_schema.as_ref(),
                 Some(&definition),
@@ -2245,6 +2399,15 @@ mod postgres_tests {
         }
         expected_fences.extend(personal.fence_attachments);
         expected_fences.extend(["artifact_heads", "artifact_revisions"].map(str::to_owned));
+        // 0066 fences the NIP-FI issuer bindings table.
+        assert!(MIGRATOR
+            .iter()
+            .find(|m| m.version == 66)
+            .expect("NIP-FI binding migration")
+            .sql
+            .as_str()
+            .contains("attach_community_write_fence('community_nip_fi_issuers')"));
+        expected_fences.insert("community_nip_fi_issuers".to_owned());
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"
@@ -2503,7 +2666,7 @@ mod postgres_tests {
         .expect("drop probe database");
     }
 
-    async fn connect_test_pool() -> PgPool {
+    pub(super) async fn connect_test_pool() -> PgPool {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .unwrap_or_else(|_| TEST_DB_URL.to_owned());
@@ -2513,7 +2676,7 @@ mod postgres_tests {
             .expect("connect to test DB")
     }
 
-    async fn reset_public_schema(pool: &PgPool) {
+    pub(super) async fn reset_public_schema(pool: &PgPool) {
         sqlx::query("DROP SCHEMA IF EXISTS public CASCADE")
             .execute(pool)
             .await
@@ -2626,42 +2789,8 @@ mod postgres_tests {
             .expect("create migrated probe database");
 
         // Bootstrap the desired-state probe through the real pgschema binary, the
-        // same invocation the test-relay launchers use. The freshly-created probe
-        // db doubles as pgschema's plan database (--plan-*), which avoids the
-        // embedded-Postgres download and matches start-relay-for-tests.sh.
-        let pgschema = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bin/pgschema");
-        let schema_file =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema/schema.sql");
-        let port = conn.port.to_string();
-        let apply = std::process::Command::new(&pgschema)
-            .args([
-                "apply",
-                "--auto-approve",
-                "--file",
-                schema_file.to_str().expect("schema path utf-8"),
-                "--host",
-                &conn.host,
-                "--port",
-                &port,
-                "--user",
-                &conn.user,
-                "--password",
-                &conn.password,
-                "--db",
-                &desired_db,
-                "--plan-host",
-                &conn.host,
-                "--plan-port",
-                &port,
-                "--plan-user",
-                &conn.user,
-                "--plan-password",
-                &conn.password,
-                "--plan-db",
-                &desired_db,
-            ])
-            .output()
-            .expect("run bin/pgschema apply (hermit env required)");
+        // same invocation the test-relay launchers use.
+        let apply = pgschema(&conn, &desired_db, &["apply", "--auto-approve"]);
         assert!(
             apply.status.success(),
             "pgschema apply failed: {}\n{}",
@@ -2711,6 +2840,134 @@ mod postgres_tests {
             .await
             .expect("drop probe database");
         }
+    }
+
+    /// Re-applying `schema/schema.sql` to a database a relay has used plans
+    /// `DROP TABLE IF EXISTS ... CASCADE` for every monthly the partition
+    /// manager created at runtime, and their rows go with them.
+    /// `.pgschemaignore` keeps those monthlies out of pgschema's view, and
+    /// pgschema does not compare partition bounds, so the advanced catch-all
+    /// is left alone too.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn pgschema_reapply_keeps_runtime_partitions() {
+        use crate::store::partition::{
+            maintain_partitions, PartitionMaintenancePolicy, PARTITION_MANAGER_MONTHS_AHEAD,
+        };
+        use sqlx::AssertSqlSafe;
+
+        let base_url = crate::test_support::database_url();
+        let conn = parse_pg_url(&base_url);
+        let admin = PgPool::connect(&base_url)
+            .await
+            .expect("connect admin database");
+        let (base_prefix, _) = base_url.rsplit_once('/').expect("database url has a path");
+        let database = format!("buzz_pgschema_reapply_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {database}")))
+            .execute(&admin)
+            .await
+            .expect("create probe database");
+
+        let apply = pgschema(&conn, &database, &["apply", "--auto-approve"]);
+        assert!(
+            apply.status.success(),
+            "pgschema apply failed: {}\n{}",
+            String::from_utf8_lossy(&apply.stdout),
+            String::from_utf8_lossy(&apply.stderr),
+        );
+
+        let pool = PgPool::connect(&format!("{base_prefix}/{database}"))
+            .await
+            .expect("connect probe database");
+        // Every pgschema caller attaches the declared children this way.
+        sqlx::raw_sql(include_str!(
+            "../../../../scripts/reconcile-schema-after-pgschema.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("reconcile schema after pgschema");
+        async fn catch_all_bounds(pool: &PgPool) -> Vec<(String, Option<String>)> {
+            sqlx::query_as(
+                "SELECT relname::text, pg_get_expr(relpartbound, oid) FROM pg_class \
+                 WHERE relname IN ('events_p_future', 'delivery_log_p_future') \
+                 ORDER BY relname",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("read catch-all bounds")
+        }
+        let declared_bounds = catch_all_bounds(&pool).await;
+        assert!(
+            declared_bounds.len() == 2 && declared_bounds.iter().all(|(_, bound)| bound.is_some()),
+            "reconcile did not attach both catch-alls: {declared_bounds:?}"
+        );
+
+        // The relay's default startup pass advances each catch-all into dated
+        // monthlies schema/partitions/ does not declare.
+        maintain_partitions(
+            &pool,
+            PARTITION_MANAGER_MONTHS_AHEAD,
+            PartitionMaintenancePolicy {
+                create_enabled: true,
+                advance_enabled: true,
+            },
+        )
+        .await
+        .expect("maintain partitions");
+        let advanced_bounds = catch_all_bounds(&pool).await;
+        for (declared, advanced) in declared_bounds.iter().zip(&advanced_bounds) {
+            assert_ne!(declared, advanced, "catch-all did not advance");
+        }
+        let children: Vec<(String, String)> = sqlx::query_as(
+            "SELECT p.relname::text, c.relname::text FROM pg_inherits i \
+             JOIN pg_class c ON c.oid = i.inhrelid \
+             JOIN pg_class p ON p.oid = i.inhparent \
+             WHERE p.relname IN ('events', 'delivery_log')",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("list partitions");
+        pool.close().await;
+        let declared = declared_monthlies();
+        let runtime: Vec<_> = children
+            .iter()
+            .filter(|(parent, child)| {
+                child.starts_with(&format!("{parent}_p2")) && !declared.contains(child)
+            })
+            .collect();
+        for parent in ["events", "delivery_log"] {
+            // The first month the declared catch-all served.
+            let first = format!("{parent}_p2026_07");
+            assert!(
+                runtime.iter().any(|(_, child)| *child == first),
+                "maintenance did not advance into {first}: {children:?}"
+            );
+        }
+
+        let plan = pgschema(&conn, &database, &["plan", "--output-sql", "stdout"]);
+        let plan_sql = String::from_utf8_lossy(&plan.stdout);
+        assert!(
+            plan.status.success(),
+            "pgschema plan failed: {plan_sql}\n{}",
+            String::from_utf8_lossy(&plan.stderr),
+        );
+        assert!(
+            !plan_sql.contains("DROP TABLE"),
+            "re-applying schema.sql would drop tables:\n{plan_sql}"
+        );
+        for (_, child) in &runtime {
+            assert!(
+                !plan_sql.contains(child.as_str()),
+                "re-applying schema.sql would change runtime monthly {child}:\n{plan_sql}"
+            );
+        }
+
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP DATABASE {database} WITH (FORCE)"
+        )))
+        .execute(&admin)
+        .await
+        .expect("drop probe database");
     }
 
     #[tokio::test]
@@ -3233,5 +3490,54 @@ mod postgres_tests {
                 "{err}"
             );
         }
+    }
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn migration_0060_refuses_active_legacy_leases_without_mutation() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations_through(&pool, 59)
+            .await
+            .expect("legacy schema");
+        let community = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities(id,host) VALUES($1,'push-cutover.example')")
+            .bind(community)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO push_leases(community_id,author,installation_id,source_event_id,source_created_at,generation,active,app_profile,endpoint_hash,endpoint_grant,max_class,subscriptions,expires_at) VALUES($1,$2,'legacy',$3,1,1,true,'buzz-ios-dogfood',$4,'opaque','default','[]',2000000000)")
+            .bind(community).bind(vec![1_u8;32]).bind(vec![2_u8;32]).bind(vec![3_u8;32])
+            .execute(&pool).await.unwrap();
+        let error = run_migrations(&pool)
+            .await
+            .expect_err("active legacy lease blocks cutover");
+        assert!(
+            error.to_string().contains("no active legacy push leases"),
+            "{error}"
+        );
+        let preserved: (bool, String) =
+            sqlx::query_as("SELECT active,app_profile FROM push_leases WHERE community_id=$1")
+                .bind(community)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(preserved, (true, "buzz-ios-dogfood".to_owned()));
+        sqlx::query("UPDATE push_leases SET active=false,app_profile=NULL,endpoint_hash=NULL,endpoint_grant=NULL,max_class=NULL,subscriptions=NULL WHERE community_id=$1")
+            .bind(community).execute(&pool).await.unwrap();
+        run_migrations(&pool)
+            .await
+            .expect("inactive legacy lease permits cutover");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM push_leases WHERE community_id=$1 AND NOT active",
+        )
+        .bind(community)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(sqlx::query("SELECT app_profile FROM push_leases")
+            .execute(&pool)
+            .await
+            .is_err());
     }
 }
